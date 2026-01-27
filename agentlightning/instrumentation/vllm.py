@@ -56,7 +56,7 @@ async def chat_completion_full_generator(
     response = response.model_copy(
         update={
             "prompt_token_ids": prompt_token_ids,
-            "response_token_ids": response_token_ids,
+            "response_token_ids": response_token_ids[0],
         }
     )
 

@@ -219,9 +219,11 @@ class AgentModeDaemon:
         mini_batch_size: int,
         pad_token_id: int,
         reward_fillna_value: float = 0.0,
-        llm_timeout_seconds: float = 1200.0,
+        llm_timeout_seconds: float = 10800.0,
         mode: Literal["v0", "v1"] = "v1",
         llm_proxy: LLMProxy | None = None,
+        llm_proxy_port: int | None = None,
+        llm_proxy_retries: int = 3,
         store: LightningStore | None = None,
         adapter: TraceToTripletBase | None = None,
         processor: Any = None,
@@ -244,9 +246,8 @@ class AgentModeDaemon:
             self.store = store
             if llm_proxy is None:
                 self.llm_proxy = LLMProxy(
-                    port=_find_available_port(),
-                    model_list=[],
-                    store=store,
+                    port=_find_available_port() if not llm_proxy_port else llm_proxy_port,
+                    num_retries=llm_proxy_retries, model_list=[], store=store,
                 )
             else:
                 # Reuse the existing LLM proxy (probably configured by user)
@@ -630,6 +631,7 @@ class AgentModeDaemon:
         """
         # Query spans for this rollout (latest attempt)
         spans = await self.store.query_spans(rollout.rollout_id, attempt_id="latest")
+        # print(f"Spans for rollout {rollout.rollout_id}: {spans}")
 
         # Convert spans to triplets using the adapter
         if not spans:
@@ -637,6 +639,7 @@ class AgentModeDaemon:
             triplets = []
         else:
             triplets = self.adapter.adapt(spans)
+        # print(f"Converted triplets for rollout {rollout.rollout_id}: {triplets}")
 
         # Extract final reward from triplets
         final_reward: Optional[float] = None
@@ -646,6 +649,7 @@ class AgentModeDaemon:
                 if triplet.reward is not None:
                     final_reward = triplet.reward
                     break
+        print(f"Final reward for rollout {rollout.rollout_id}: {final_reward}")
 
         # Construct the Task object from Rollout
         task = Task(
@@ -683,10 +687,12 @@ class AgentModeDaemon:
                 if rollout.rollout_id in self._completed_rollouts_v0:
                     # Already processed, skip
                     continue
+                # print(f"Processing completed rollout: {rollout}")
                 if isinstance(rollout, Rollout):
                     rollout = await self._validate_data_v1(rollout)
                 else:
                     self._validate_data(rollout)
+                # print(f"Validated rollout: {rollout}")
                 if rollout.rollout_id not in self._task_id_to_original_sample:
                     print(f"Warning: Received unknown rollout ID {rollout.rollout_id}, skipping.")
                 else:

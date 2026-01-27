@@ -6,13 +6,19 @@
 
 from __future__ import annotations
 
+import os
+import socket
 from typing import TYPE_CHECKING, Any, Type
 
 import hydra
 import ray
-from ray.actor import ActorClass
-from verl.trainer.main_ppo import create_rl_sampler
+from omegaconf import OmegaConf
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from verl.trainer import main_ppo
 from verl.trainer.ppo.reward import load_reward_manager
+from verl.trainer.ppo.utils import need_critic, need_reference_policy
+from verl.utils.config import validate_config
+from verl.utils.device import auto_set_device, is_cuda_available
 
 from agentlightning.adapter import TraceAdapter
 from agentlightning.llm_proxy import LLMProxy
@@ -37,12 +43,16 @@ def main(config: Any):
     from .daemon import AgentModeDaemon
     from .trainer import AgentLightningTrainer
 
+    # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
+    auto_set_device(config)
+
     run_ppo(
         config,
         train_dataset=None,
         val_dataset=None,
         store=None,
         llm_proxy=None,
+        llm_proxy_port=None,
         adapter=None,
         trainer_cls=AgentLightningTrainer,
         daemon_cls=AgentModeDaemon,
@@ -55,26 +65,75 @@ def run_ppo(
     val_dataset: Dataset[Any] | None,
     store: LightningStore | None,
     llm_proxy: LLMProxy | None,
+    llm_proxy_port: int | None,
     adapter: TraceAdapter[Any] | None,
     trainer_cls: Type[AgentLightningTrainer],
     daemon_cls: Type[AgentModeDaemon],
+    task_runner_class=None
 ) -> None:
     if not ray.is_initialized():
-        # this is for local ray cluster
-        try:
-            # verl >= 0.6.0
-            num_cpus = config.ray_kwargs.ray_init.num_cpus
-        except AttributeError:
-            # verl < 0.6.0
-            num_cpus = config.ray_init.num_cpus
-        ray.init(
-            runtime_env={
-                "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
-            },
-            num_cpus=num_cpus,
-        )
+        # Initialize Ray with a local cluster configuration
+        # Set environment variables in the runtime environment to control tokenizer parallelism,
+        # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
+        # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
+        default_runtime_env = get_ppo_ray_runtime_env()
+        ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
+        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
 
-    runner = TaskRunner.remote()
+        if config.transfer_queue.enable:
+            # Add runtime environment variables for transfer queue
+            runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
+            runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
+            runtime_env_kwargs["env_vars"] = runtime_env_vars
+
+        if "env_vars" not in runtime_env_kwargs:
+            runtime_env_kwargs["env_vars"] = {
+                "TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
+                "VLLM_LOGGING_LEVEL": "WARN",
+                "TIKTOKEN_ENCODINGS_BASE": os.getenv("TIKTOKEN_ENCODINGS_BASE", ""),
+                "WANDB_API_KEY": os.getenv("WANDB_API_KEY", ""),
+                "CUDA_DEVICE_MAX_CONNECTIONS": os.getenv("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
+                "NVTE_DEBUG": os.getenv("NVTE_DEBUG", "0"),
+                "NVTE_DEBUG_LEVEL": os.getenv("NVTE_DEBUG_LEVEL", "2"),
+            }
+        else:
+            runtime_env_kwargs["env_vars"].update({
+                "TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
+                "VLLM_LOGGING_LEVEL": "WARN",
+                "TIKTOKEN_ENCODINGS_BASE": os.getenv("TIKTOKEN_ENCODINGS_BASE", ""),
+                "WANDB_DIR": os.getenv("WANDB_DIR", ""),
+                "WANDB_API_KEY": os.getenv("WANDB_API_KEY", ""),
+                "CUDA_DEVICE_MAX_CONNECTIONS": os.getenv("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
+                "NVTE_DEBUG": os.getenv("NVTE_DEBUG", "0"),
+                "NVTE_DEBUG_LEVEL": os.getenv("NVTE_DEBUG_LEVEL", "2"),
+            })
+
+        runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
+        ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        print(f"ray init kwargs: {ray_init_kwargs}")
+        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+
+    if task_runner_class is None:
+        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
+
+    # Create a remote instance of the TaskRunner class, and
+    # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+    if (
+        is_cuda_available
+        and config.global_profiler.tool == "nsys"
+        and config.global_profiler.get("steps") is not None
+        and len(config.global_profiler.get("steps", [])) > 0
+    ):
+        from verl.utils.import_utils import is_nvtx_available
+
+        assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
+        nsight_options = OmegaConf.to_container(
+            config.global_profiler.global_tool_config.nsys.controller_nsight_options
+        )
+        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+    else:
+        runner = task_runner_class.remote()
+
     ray.get(
         runner.run.remote(  # type: ignore
             config=config,
@@ -82,15 +141,22 @@ def run_ppo(
             val_dataset=val_dataset,
             store=store,
             llm_proxy=llm_proxy,
+            llm_proxy_port=llm_proxy_port,
             adapter=adapter,
             trainer_cls=trainer_cls,
             daemon_cls=daemon_cls,
         )
     )
 
+    # [Optional] get the path of the timeline trace file from the configuration, default to None
+    # This file is used for performance analysis
+    timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
+    if timeline_json_file:
+        ray.timeline(filename=timeline_json_file)
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
-class TaskRunner:
+
+class TaskRunner(main_ppo.TaskRunner):
+
     def run(
         self,
         config: Any,
@@ -98,6 +164,7 @@ class TaskRunner:
         val_dataset: Dataset[Any] | None,
         store: LightningStore | None,
         llm_proxy: LLMProxy | None,
+        llm_proxy_port: int | None,
         adapter: TraceAdapter[Any] | None,
         trainer_cls: Type[AgentLightningTrainer],
         daemon_cls: Type[AgentModeDaemon],
@@ -108,95 +175,54 @@ class TaskRunner:
         from omegaconf import OmegaConf
         from verl.utils.fs import copy_to_local
 
-        pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
+        print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        # download the checkpoint from hdfs
-        local_path = copy_to_local(config.actor_rollout_ref.model.path)
+        actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
+        self.add_critic_worker(config)
 
-        # instantiate tokenizer
-        from verl.utils.tokenizer import hf_processor, hf_tokenizer
-
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
-
-        # define worker classes
-        if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
-            assert config.critic.strategy in ["fsdp", "fsdp2"]
-            from verl.single_controller.ray import RayWorkerGroup
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
-
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
-            )
-            ray_worker_group_cls = RayWorkerGroup
-
-        elif config.actor_rollout_ref.actor.strategy == "megatron":
-            assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            # FIXME: This import is outdated
-            from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup  # type: ignore
-            from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
-
-            actor_rollout_cls = ActorRolloutRefWorker
-            ray_worker_group_cls = NVMegatronRayWorkerGroup
-
-        else:
-            raise NotImplementedError
-
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-
-        try:
-            # verl >= 0.6.0
-            from verl.trainer.ppo.utils import Role
-        except ImportError:
-            # Fallback for verl <= 0.5.0
-            from verl.trainer.ppo.ray_trainer import Role  # type: ignore
-
-        role_worker_mapping: dict[Role, ActorClass[Any]] = {
-            Role.ActorRollout: ray.remote(actor_rollout_cls),
-            Role.Critic: ray.remote(CriticWorker),
-        }
-
-        global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
-        mapping = {
-            Role.ActorRollout: global_pool_id,
-            Role.Critic: global_pool_id,
-        }
-
-        # we should adopt a multi-source reward function here
+        # We should adopt a multi-source reward function here:
         # - for rule-based rm, we directly call a reward score
         # - for model-based rm, we call a model
         # - for code related prompt, we send to a sandbox if there are test cases
-        # - finally, we combine all the rewards together
-        # - The reward type depends on the tag of the data
-        if config.reward_model.enable:
-            if config.reward_model.strategy in ["fsdp", "fsdp2"]:
-                from verl.workers.fsdp_workers import RewardModelWorker
-            elif config.reward_model.strategy == "megatron":
-                from verl.workers.megatron_workers import RewardModelWorker
-            else:
-                raise NotImplementedError
-            role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-            mapping[Role.RewardModel] = global_pool_id
+        # finally, we combine all the rewards together
+        # The reward type depends on the tag of the data
+        self.add_reward_model_worker(config)
 
-        # use reference model
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
-            mapping[Role.RefPolicy] = global_pool_id
+        # Add a reference policy worker if KL loss or KL reward is used.
+        self.add_ref_policy_worker(config, actor_rollout_cls)
 
+        # validate config
+        validate_config(
+            config=config,
+            use_reference_policy=need_reference_policy(config),
+            use_critic=need_critic(config),
+        )
+
+        # Download the checkpoint from HDFS to the local machine.
+        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
+        local_path = copy_to_local(
+            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+        )
+
+        # Instantiate the tokenizer and processor.
+        from verl.utils import hf_processor, hf_tokenizer
+
+        trust_remote_code = config.data.get("trust_remote_code", False)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        # Used for multimodal LLM, could be None
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+
+        # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
         val_reward_fn = load_reward_manager(
             config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+
+        resource_pool_manager = self.init_resource_pool_mgr(config)
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
@@ -221,12 +247,12 @@ class TaskRunner:
         else:
             val_dataset = LoadedDataset(val_dataset)
 
-        train_sampler = create_rl_sampler(config.data, train_dataset)
+        train_sampler = main_ppo.create_rl_sampler(config.data, train_dataset)
         trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
-            role_worker_mapping=role_worker_mapping,
+            role_worker_mapping=self.role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,
             reward_fn=reward_fn,
@@ -237,6 +263,7 @@ class TaskRunner:
             train_sampler=train_sampler,
             store=store,
             llm_proxy=llm_proxy,
+            llm_proxy_port=llm_proxy_port,
             adapter=adapter,
             daemon_cls=daemon_cls,
         )

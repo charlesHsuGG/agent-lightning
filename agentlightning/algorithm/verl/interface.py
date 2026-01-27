@@ -127,12 +127,13 @@ class VERL(Algorithm):
         config: dict[str, Any],
         trainer_cls: Optional[Type[AgentLightningTrainer]] = None,
         daemon_cls: Optional[Type[AgentModeDaemon]] = None,
+        use_megatron_base_config: bool = False
     ):
         super().__init__()
 
         # Compose the base config exactly like your decorator:
         with initialize(version_base=None, config_path="pkg://agentlightning/verl"):
-            base_cfg = compose(config_name="config")
+            base_cfg = compose(config_name="config") if not use_megatron_base_config else compose(config_name="megatron_config")
 
         # Merge your dict overrides
         override_conf = OmegaConf.create(config)
@@ -173,6 +174,7 @@ class VERL(Algorithm):
                 val_dataset=val_dataset,
                 store=None,
                 llm_proxy=None,
+                llm_proxy_port=self.config.agentlightning.llm_proxy_port if hasattr(self.config.agentlightning, "llm_proxy_port") else None,
                 adapter=None,
                 trainer_cls=trainer_cls,
                 daemon_cls=daemon_cls,
@@ -187,6 +189,7 @@ class VERL(Algorithm):
                 val_dataset=val_dataset,
                 store=store,
                 llm_proxy=llm_proxy,
+                llm_proxy_port=self.config.agentlightning.llm_proxy_port if hasattr(self.config.agentlightning, "llm_proxy_port") else None,
                 adapter=adapter,
                 trainer_cls=trainer_cls,
                 daemon_cls=daemon_cls,

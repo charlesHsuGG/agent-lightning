@@ -3,7 +3,7 @@ hydra:
     - pkg://verl/trainer/config
 
 defaults:
-  - ppo_trainer
+  - ppo_megatron_trainer
   - _self_
 
 agentlightning:
@@ -24,4 +24,4 @@ actor_rollout_ref:
     agent:
       custom_async_server:
         path: pkg://agentlightning.verl.async_server
-        name: PatchedSGLangHttpServer
+        name: PatchedvLLMServer

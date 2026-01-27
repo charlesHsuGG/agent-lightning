@@ -428,6 +428,7 @@ class TraceTree:
         if re.search(llm_call_match, self.span.name) is None:
             # The span name does not match the LLM call match.
             is_llm_call = False
+
         if is_llm_call:
             # Check the response id
             response_id = _attributes_get_multiple(
@@ -732,6 +733,7 @@ class TraceTree:
             within_llm_call=False if dedup_llm_call else None,
             existing_llm_call_response_ids=set(),
         )
+        # print("Found LLM calls:", llm_calls)
 
         id_transitions: List[Tuple[str, Triplet]] = []
         # We need to filter out the LLM calls with unrecorded token IDs
@@ -748,6 +750,8 @@ class TraceTree:
             filtered_llm_calls.append((llm_call, agent_name))
             id_transitions.append((llm_call.id, triplet))
 
+        # print("Filtered LLM calls:", filtered_llm_calls)
+
         rewards = self.match_rewards(reward_match, [call for call, _ in filtered_llm_calls])
         transitions = [
             transition.model_copy(update={"reward": rewards.get(id, None)}) for id, transition in id_transitions
@@ -755,6 +759,7 @@ class TraceTree:
         if final_reward is not None and len(transitions) > 0:
             # Add the final reward to the last transition
             transitions[-1] = transitions[-1].model_copy(update={"reward": final_reward})
+        # print("Final transitions:", transitions)
         return transitions
 
     def __repr__(self):
@@ -1024,5 +1029,4 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                     ),
                 )
             )
-
         return triplets

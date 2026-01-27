@@ -19,11 +19,7 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.metric_utils import (
-    _compute_response_info,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-)
+from verl.trainer.ppo.metric_utils import _compute_response_info, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
     RayPPOTrainer,
@@ -177,6 +173,7 @@ class AgentLightningTrainer(RayPPOTrainer):
         self,
         store: LightningStore | None,
         llm_proxy: LLMProxy | None,
+        llm_proxy_port: int | None,
         adapter: TraceAdapter | None,
         daemon_cls: Type[AgentModeDaemon],
         **kwargs,
@@ -184,6 +181,7 @@ class AgentLightningTrainer(RayPPOTrainer):
         super().__init__(**kwargs)
         self.store = store
         self.llm_proxy = llm_proxy
+        self.llm_proxy_port = llm_proxy_port
         self.adapter = adapter
         self.daemon_cls = daemon_cls
 
@@ -310,12 +308,17 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # recompute old_log_probs
             with _timer("old_log_prob", timing_raw):
-                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                # old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
                 loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                 entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                old_log_prob_metrics = {
+                    "actor/entropy_loss": entropy_loss.detach().item(),
+                    "perf/mfu/actor_infer": old_log_prob_mfu,
+                }
+                # old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
                 metrics.update(old_log_prob_metrics)
                 old_log_prob.batch.pop("entropys")
                 batch = batch.union(old_log_prob)
@@ -473,6 +476,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             mode="v1" if self.store is not None else "v0",
             store=self.store,
             llm_proxy=self.llm_proxy,
+            llm_proxy_port=self.llm_proxy_port,
             adapter=self.adapter,
             processor=self.processor,  # For Qwen2-VL mrope position_ids
             image_base_dir=getattr(self.config.data, "image_base_dir", None),
