@@ -45,7 +45,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import Scope
+from starlette.types import Scope, Message
 
 from agentlightning.semconv import LightningResourceAttributes
 from agentlightning.types import LLM, ProxyLLM
@@ -573,20 +573,30 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
             else:
                 logger.warning("Store is not set. Skipping sequence id allocation and header injection.")
         else:
-            data = await request.json()  # consume body to avoid issues downstream
-            if "custom_params" in data:
-                user_info = data.get("custom_params", {}).pop("user_info", {})
-                if "user_id" in user_info and "thread_id" in user_info:
-                    attempt_id, rollout_id = user_info.get("user_id"), user_info.get("thread_id")
-                    store = get_active_llm_proxy().get_store()
-                    if store is not None:
-                        # Allocate a monotonic sequence id per (rollout, attempt).
-                        sequence_id = await store.get_next_span_sequence_id(rollout_id, attempt_id)
-                    request.scope["headers"] = list(request.scope["headers"]) + [
-                        (b"x-rollout-id", rollout_id.encode()),
-                        (b"x-attempt-id", attempt_id.encode()),
-                        (b"x-sequence-id", str(sequence_id).encode()),
-                    ]
+            req_body = await request.body()
+
+            # 2. Recreate the request stream so it can be read again by the route handler
+            async def receive() -> Message:
+                return {"type": "http.request", "body": req_body}
+            
+            request._receive = receive
+            try:
+                body_json = json.loads(req_body.decode())
+                if "custom_params" in body_json:
+                    user_info = body_json.get("custom_params", {}).pop("user_info", {})
+                    if "user_id" in user_info and "thread_id" in user_info:
+                        attempt_id, rollout_id = user_info.get("user_id"), user_info.get("thread_id")
+                        store = get_active_llm_proxy().get_store()
+                        if store is not None:
+                            # Allocate a monotonic sequence id per (rollout, attempt).
+                            sequence_id = await store.get_next_span_sequence_id(rollout_id, attempt_id)
+                        request.scope["headers"] = list(request.scope["headers"]) + [
+                            (b"x-rollout-id", rollout_id.encode()),
+                            (b"x-attempt-id", attempt_id.encode()),
+                            (b"x-sequence-id", str(sequence_id).encode()),
+                        ]
+            except json.JSONDecodeError:
+                pass
         response = await call_next(request)
         return response
 
