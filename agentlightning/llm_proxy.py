@@ -572,7 +572,21 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
                 ]
             else:
                 logger.warning("Store is not set. Skipping sequence id allocation and header injection.")
-
+        else:
+            data = await request.json()  # consume body to avoid issues downstream
+            if "custom_params" in data:
+                user_info = data.get("custom_params", {}).pop("user_info", {})
+                if "user_id" in user_info and "thread_id" in user_info:
+                    attempt_id, rollout_id = user_info.get("user_id"), user_info.get("thread_id")
+                    store = get_active_llm_proxy().get_store()
+                    if store is not None:
+                        # Allocate a monotonic sequence id per (rollout, attempt).
+                        sequence_id = await store.get_next_span_sequence_id(rollout_id, attempt_id)
+                    request.scope["headers"] = list(request.scope["headers"]) + [
+                        (b"x-rollout-id", rollout_id.encode()),
+                        (b"x-attempt-id", attempt_id.encode()),
+                        (b"x-sequence-id", str(sequence_id).encode()),
+                    ]
         response = await call_next(request)
         return response
 
