@@ -447,6 +447,24 @@ class InMemoryWeaveTraceServer(TraceServerClientInterface):
     def annotator_queue_items_progress_update(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError()
 
+    def calls_complete(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError()
+
+    def call_start_v2(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError()
+
+    def call_end_v2(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError()
+
+    def call_stats(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError()
+
+    def trace_usage(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError()
+
+    def calls_usage(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError()
+
 
 # Module-level storage for originals
 _original_init_weave_get_server: Callable[..., Any] | None = None
