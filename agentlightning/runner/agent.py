@@ -299,7 +299,13 @@ class LitAgentRunner(Runner[T_task]):
                 attempt_id=rollout.attempt.attempt_id,
                 sequence_id=sequence_id,
             )
-            await store.add_span(reward_span)
+            added_span = await store.add_span(reward_span)
+            if added_span is not None:
+                trace_spans.append(added_span)
+            else:
+                logger.error(
+                    f"{self._log_prefix(rollout.rollout_id)} Failed to add OpenTelemetry span to the store: {reward_span}"
+                )
             result_recognized = True
 
         # Case 2-4: result is a list

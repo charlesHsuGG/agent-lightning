@@ -19,6 +19,7 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from agentlightning.adapter import TraceAdapter
 from agentlightning.llm_proxy import LLMProxy
@@ -114,7 +115,10 @@ def run_ppo(
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     if task_runner_class is None:
-        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
+        nodes = ray.nodes()
+        target_node_id = next(node["NodeID"] for node in nodes if "worker-0" in node["NodeManagerHostname"])
+        print(f"Scheduling main_task on node_id: {target_node_id}")
+        task_runner_class = ray.remote(num_cpus=1, scheduling_strategy=NodeAffinitySchedulingStrategy(target_node_id, soft=False))(TaskRunner)  # please make sure main_task is not scheduled on head
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
