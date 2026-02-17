@@ -172,7 +172,9 @@ class AddReturnTokenIds(CustomLogger):
             return e
 
         # Ensure token ids are requested from the backend when supported.
-        return {**data, "return_token_ids": True}
+        if "return_token_ids" not in data:
+            return {**data, "return_token_ids": True}
+        return {**data}
 
 
 class AddLogprobs(CustomLogger):
@@ -596,7 +598,7 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
                             (b"x-sequence-id", str(sequence_id).encode()),
                         ]
             except json.JSONDecodeError:
-                pass
+                logger.warning("Store is not set. Skipping sequence id allocation and header injection.")
         response = await call_next(request)
         return response
 

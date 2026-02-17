@@ -90,23 +90,12 @@ def run_ppo(
         if "env_vars" not in runtime_env_kwargs:
             runtime_env_kwargs["env_vars"] = {
                 "TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
-                "VLLM_LOGGING_LEVEL": "WARN",
-                "TIKTOKEN_ENCODINGS_BASE": os.getenv("TIKTOKEN_ENCODINGS_BASE", ""),
-                "WANDB_API_KEY": os.getenv("WANDB_API_KEY", ""),
-                "CUDA_DEVICE_MAX_CONNECTIONS": os.getenv("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
-                "NVTE_DEBUG": os.getenv("NVTE_DEBUG", "0"),
-                "NVTE_DEBUG_LEVEL": os.getenv("NVTE_DEBUG_LEVEL", "2"),
+                "VLLM_LOGGING_LEVEL": "WARN", **dict(os.environ.items())
             }
         else:
             runtime_env_kwargs["env_vars"].update({
                 "TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
-                "VLLM_LOGGING_LEVEL": "WARN",
-                "TIKTOKEN_ENCODINGS_BASE": os.getenv("TIKTOKEN_ENCODINGS_BASE", ""),
-                "WANDB_DIR": os.getenv("WANDB_DIR", ""),
-                "WANDB_API_KEY": os.getenv("WANDB_API_KEY", ""),
-                "CUDA_DEVICE_MAX_CONNECTIONS": os.getenv("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
-                "NVTE_DEBUG": os.getenv("NVTE_DEBUG", "0"),
-                "NVTE_DEBUG_LEVEL": os.getenv("NVTE_DEBUG_LEVEL", "2"),
+                "VLLM_LOGGING_LEVEL": "WARN", **dict(os.environ.items())
             })
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
@@ -118,7 +107,9 @@ def run_ppo(
         nodes = ray.nodes()
         target_node_id = next(node["NodeID"] for node in nodes if "worker-0" in node["NodeManagerHostname"])
         print(f"Scheduling main_task on node_id: {target_node_id}")
-        task_runner_class = ray.remote(num_cpus=1, scheduling_strategy=NodeAffinitySchedulingStrategy(target_node_id, soft=False))(TaskRunner)  # please make sure main_task is not scheduled on head
+        task_runner_class = ray.remote(
+            num_cpus=1, scheduling_strategy=NodeAffinitySchedulingStrategy(target_node_id, soft=False)
+        )(TaskRunner)  # please make sure main_task is not scheduled on head
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
