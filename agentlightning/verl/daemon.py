@@ -1139,8 +1139,36 @@ class AgentModeDaemon:
 
         return data_proto, data_metrics
 
+    def _cleanup_store_rollouts(self, rollout_ids: List[str]):
+        """Clean up finished rollouts from the store to prevent memory buildup.
+
+        This runs the async cleanup synchronously on the internal event loop.
+        """
+        from agentlightning.store.memory import InMemoryLightningStore
+
+        if not isinstance(self.store, InMemoryLightningStore):
+            return
+
+        if self._internal_loop is None:
+            return
+
+        try:
+            coro = self.store.cleanup_finished_rollouts(rollout_ids)
+            future = asyncio.run_coroutine_threadsafe(coro, self._internal_loop)
+            future.result(timeout=60)
+        except Exception as e:
+            print(f"Warning: Failed to clean up store rollouts: {e}")
+
     def clear_data_and_server(self):
-        """Resets the internal state of the daemon for the next run."""
+        """Resets the internal state of the daemon for the next run.
+
+        Also cleans up finished rollouts from the store to prevent memory leaks
+        during long training runs.
+        """
+        # Collect rollout IDs before clearing so we can clean up the store.
+        # In v1 mode, _task_id_to_original_sample maps rollout_id -> sample.
+        finished_rollout_ids = list(self._task_id_to_original_sample.keys())
+
         self.backend_llm_server_addresses = []
         self._completed_rollouts_v0.clear()
         self._task_id_to_original_sample.clear()
@@ -1148,6 +1176,12 @@ class AgentModeDaemon:
         # For a true reset, the server's internal queues would also need clearing.
         # This implementation assumes that `set_up_data_and_server` is called
         # for each new run, effectively starting a fresh batch.
+
+        # Clean up finished rollouts from the store to free memory.
+        # This is critical for long training runs where rollout data accumulates
+        # in the in-memory store across training steps, causing OOM.
+        if self.mode == "v1" and finished_rollout_ids:
+            self._cleanup_store_rollouts(finished_rollout_ids)
 
     def _fillna_reward(self, rollout: RolloutLegacy):
         if rollout.final_reward is None:

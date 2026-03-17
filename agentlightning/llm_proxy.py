@@ -45,7 +45,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import Scope, Message
+from starlette.types import Message, Scope
 
 from agentlightning.semconv import LightningResourceAttributes
 from agentlightning.types import LLM, ProxyLLM
@@ -389,9 +389,9 @@ class LightningSpanExporter(SpanExporter):
                 headers_merged.update(cast(Dict[str, Any], headers))
 
             if not headers_merged:
-                logger.warning(
-                    f"No headers found in {len(subtree_spans)} subtree spans of root {root_span_id}. Cannot log to store."
-                )
+                # logger.warning(
+                #     f"No headers found in {len(subtree_spans)} subtree spans of root {root_span_id}. Cannot log to store."
+                # )
                 continue
 
             # Validate and normalize required header fields.
@@ -399,15 +399,17 @@ class LightningSpanExporter(SpanExporter):
             attempt_id = headers_merged.get("x-attempt-id")
             sequence_id = headers_merged.get("x-sequence-id")
             if not rollout_id or not attempt_id or not sequence_id or not sequence_id.isdigit():
-                logger.warning(
-                    f"Missing or invalid rollout_id, attempt_id, or sequence_id in headers: {headers_merged}. Cannot log to store."
-                )
+                # logger.warning(
+                #     f"Missing or invalid rollout_id, attempt_id, or sequence_id in headers: {headers_merged}. Cannot log to store."
+                # )
                 continue
+
             if not isinstance(rollout_id, str) or not isinstance(attempt_id, str):
                 logger.warning(
                     f"rollout_id or attempt_id is not a string: {rollout_id}, {attempt_id}. Cannot log to store."
                 )
                 continue
+
             sequence_id_decimal = int(sequence_id)
 
             # Persist each span in the subtree with the resolved identifiers.

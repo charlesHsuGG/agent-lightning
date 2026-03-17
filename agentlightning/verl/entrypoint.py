@@ -13,13 +13,13 @@ from typing import TYPE_CHECKING, Any, Type
 import hydra
 import ray
 from omegaconf import OmegaConf
-from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from verl.trainer import main_ppo
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from agentlightning.adapter import TraceAdapter
 from agentlightning.llm_proxy import LLMProxy
@@ -87,15 +87,20 @@ def run_ppo(
             runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
+        allow_broadcast_env = ["HF_", "NVTE_", "CUDA_", "WANDB_", "TIKTOKEN_", "NCCL_"]
+        default_env_vars = {
+            key: value for key, value in os.environ.items()
+            if any(key.startswith(prefix) for prefix in allow_broadcast_env)
+        }
         if "env_vars" not in runtime_env_kwargs:
             runtime_env_kwargs["env_vars"] = {
                 "TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
-                "VLLM_LOGGING_LEVEL": "WARN", **dict(os.environ.items())
+                "VLLM_LOGGING_LEVEL": "WARN", **default_env_vars
             }
         else:
             runtime_env_kwargs["env_vars"].update({
                 "TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
-                "VLLM_LOGGING_LEVEL": "WARN", **dict(os.environ.items())
+                "VLLM_LOGGING_LEVEL": "WARN", **default_env_vars
             })
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)

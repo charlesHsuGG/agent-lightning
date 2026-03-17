@@ -4,13 +4,13 @@
 
 from __future__ import annotations
 
+import gc
 import random
 from contextlib import contextmanager
 from copy import deepcopy
 from pprint import pprint
-from typing import Dict, Tuple, Type
+from typing import Any, Dict, Type
 
-import numpy as np
 import torch
 import verl
 from codetiming import Timer
@@ -101,6 +101,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, suffix: str 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
+    return_var = torch.tensor(0.0)
+    return_diff_var = torch.tensor(0.0)
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
@@ -286,6 +288,10 @@ class AgentLightningTrainer(RayPPOTrainer):
 
                     del gen_baseline_batch, gen_baseline_output
 
+            # Release the original input batch to free memory now that
+            # training data has been extracted from the daemon.
+            del gen_batch
+
             # uid is used for algorithm like GRPO, should be aligned to data id
             batch.non_tensor_batch["uid"] = batch.non_tensor_batch["data_id_list"]
 
@@ -417,13 +423,14 @@ class AgentLightningTrainer(RayPPOTrainer):
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             if rollout_data_dir:
                 with _timer("dump_rollout_generations", timing_raw):
-                    print(batch.batch.keys())
                     inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                     outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                     scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                    sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
                     self._dump_generations(
                         inputs=inputs,
                         outputs=outputs,
+                        gts=sample_gts,
                         scores=scores,
                         reward_extra_infos_dict=reward_extra_infos_dict,
                         dump_path=rollout_data_dir,
@@ -435,6 +442,13 @@ class AgentLightningTrainer(RayPPOTrainer):
         # TODO: implement actual tflpo and theoretical tflpo
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+        # Explicitly release batch tensors and trigger garbage collection to
+        # prevent memory accumulation across training steps.
+        del batch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return metrics
 
@@ -544,7 +558,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                     progress_bar.close()
 
                     # This exit logic is to ensure a robust CI.
-                    pprint(f"Flush the logger...")
+                    pprint("Flush the logger...")
                     del logger  # Make sure the loggers are flushed and closed properly
                     pprint(f"Training finished at step {self.global_steps}.")
                     return
