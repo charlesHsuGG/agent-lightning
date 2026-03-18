@@ -87,7 +87,7 @@ def run_ppo(
             runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
-        allow_broadcast_env = ["HF_", "NVTE_", "CUDA_", "WANDB_", "TIKTOKEN_", "NCCL_"]
+        allow_broadcast_env = ["HF_", "NVTE_", "CUDA_", "WANDB_", "TIKTOKEN_", "NCCL_", "VLLM_", "SGLANG_", "TORCH_"]
         default_env_vars = {
             key: value for key, value in os.environ.items()
             if any(key.startswith(prefix) for prefix in allow_broadcast_env)
