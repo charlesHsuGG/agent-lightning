@@ -845,6 +845,9 @@ class AgentModeDaemon:
                     "prompt_ids": t.prompt.get("token_ids", []),
                     "response_ids": t.response.get("token_ids", []),
                     "image_urls": t.prompt.get("image_urls", []),
+                    "rollout_log_probs": [
+                        log_prob.get("log_prob", 0.0) for log_prob in t.metadata.response.get("log_probs", [])
+                    ] if hasattr(t.metadata, "response") and t.metadata.response and t.metadata.response.get("log_probs") else [],
                 }
                 for t in rollout.triplets
             ]
@@ -940,7 +943,7 @@ class AgentModeDaemon:
                         self.tokenizer,
                         self.trace_aggregator.get("debug", False),
                     )
-                    if not is_prefix and self.trace_aggregator.get("debug", False) == True:
+                    if not is_prefix and self.trace_aggregator.get("debug", False) is True:
                         template_mismatch_count += diagnostic[0]
                         retoken_mismatch_count += diagnostic[1]
                         others_mismatch_count += diagnostic[2]

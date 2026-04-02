@@ -11,6 +11,7 @@ from copy import deepcopy
 from pprint import pprint
 from typing import Any, Dict, Type
 
+import numpy as np
 import torch
 import verl
 from codetiming import Timer
@@ -312,22 +313,56 @@ class AgentLightningTrainer(RayPPOTrainer):
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
             batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
 
-            # recompute old_log_probs
-            with _timer("old_log_prob", timing_raw):
-                # old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                entropys = old_log_prob.batch["entropys"]
-                response_masks = batch.batch["response_mask"]
-                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                old_log_prob_metrics = {
-                    "actor/entropy_loss": entropy_loss.detach().item(),
-                    "perf/mfu/actor_infer": old_log_prob_mfu,
-                }
-                # old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
-                metrics.update(old_log_prob_metrics)
-                old_log_prob.batch.pop("entropys")
-                batch = batch.union(old_log_prob)
+            # Operating Mode Selection:
+            # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+            # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+            #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+            bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+            if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+
+                apply_bypass_mode(
+                    batch=batch,
+                    rollout_corr_config=rollout_corr_config,
+                    policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                )
+            else:  # Recompute old_log_probs
+
+                # recompute old_log_probs
+                with _timer("old_log_prob", timing_raw):
+                    # old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                    old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                    entropys = old_log_prob.batch["entropys"]
+                    response_masks = batch.batch["response_mask"]
+                    actor_config = self.config.actor_rollout_ref.actor
+                    entropy_loss = agg_loss(
+                        loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=actor_config.loss_agg_mode,
+                        loss_scale_factor=actor_config.loss_scale_factor
+                    )
+                    old_log_prob_metrics = {
+                        "actor/entropy_loss": entropy_loss.detach().item(),
+                        "perf/mfu/actor_infer": old_log_prob_mfu,
+                    }
+                    # old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                    metrics.update(old_log_prob_metrics)
+                    old_log_prob.batch.pop("entropys")
+                    if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+                        raise ValueError(
+                            "Detected conflicting router replay configuration: "
+                            "router_replay.mode='R2' and enable_rollout_routing_replay=True "
+                            "cannot be enabled simultaneously. "
+                            "The enable_rollout_routing_replay option is only used in R3 mode; "
+                            "it should not be set when using R2 mode."
+                        )
+                    batch = batch.union(old_log_prob)
+                    if "rollout_log_probs" in batch.batch.keys():
+                        # TODO: we may want to add diff of probs too.
+                        from verl.utils.debug.metrics import calculate_debug_metrics
+
+                        metrics.update(calculate_debug_metrics(batch))
+
+            assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
             if self.use_reference_policy:
                 # compute reference log_prob
@@ -349,6 +384,12 @@ class AgentLightningTrainer(RayPPOTrainer):
                 # if agent_mode is enabled, there is already token_level_scores
                 # token_level_scores is not needed to compute here
 
+                reward_extra_infos_dict: dict[str, list]
+                batch.batch["token_level_scores"] = reward_tensor
+
+                if reward_extra_infos_dict:
+                    batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
                 # compute rewards. apply_kl_penalty if available
                 if self.config.algorithm.use_kl_in_reward:
                     batch, kl_metrics = apply_kl_penalty(
@@ -357,6 +398,21 @@ class AgentLightningTrainer(RayPPOTrainer):
                     metrics.update(kl_metrics)
                 else:
                     batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                # Compute rollout correction: IS weights, rejection sampling, and metrics
+                # Only runs in decoupled mode (computes once per batch using stable π_old)
+                # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                if (
+                    rollout_corr_config is not None
+                    and "rollout_log_probs" in batch.batch
+                    and not bypass_recomputing_logprobs  # Only in decoupled mode
+                ):
+                    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                    # Compute IS weights, apply rejection sampling, compute metrics
+                    batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                    # IS and off-policy metrics already have rollout_corr/ prefix
+                    metrics.update(is_metrics)
 
                 # compute advantages, executed on the driver process
 

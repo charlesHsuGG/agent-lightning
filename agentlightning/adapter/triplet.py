@@ -889,7 +889,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                 return v
         return v
 
-    def _extract_tokens_from_raw(self, attrs: Dict[str, Any]) -> Tuple[List[int], List[int]]:
+    def _extract_tokens_from_raw(self, attrs: Dict[str, Any]) -> Tuple[List[int], List[int], List[dict]]:
         """Extract token ids from raw_gen_ai_request attributes.
 
         - llm.hosted_vllm.prompt_token_ids: string -> List[int]
@@ -898,6 +898,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
         """
         prompt_ids: List[int] = []
         resp_ids: List[int] = []
+        resp_probs: List[float] = []
 
         # prompt
         p = attrs.get("llm.hosted_vllm.prompt_token_ids")
@@ -923,19 +924,28 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                     tids = cast(Dict[str, Any], cand).get("token_ids")
                     if isinstance(tids, list) and all(isinstance(x, int) for x in tids):  # type: ignore
                         resp_ids = cast(List[int], tids)
+                    logsprobs = cast(Dict[str, Any], cand).get("logprobs", {}).get("content")
+                    if isinstance(logsprobs, list):
+                        logsprobs = self._literal_eval_maybe(logsprobs)
+                        if isinstance(logsprobs, list) and all(isinstance(x, (dict)) for x in logsprobs):  # type: ignore
+                            resp_probs = cast(List[dict], logsprobs)
 
-        return prompt_ids, resp_ids
+        return prompt_ids, resp_ids, resp_probs
 
-    def _extract_tokens_from_openai(self, attrs: Dict[str, Any]) -> Tuple[List[int], List[int]]:
+    def _extract_tokens_from_openai(self, attrs: Dict[str, Any]) -> Tuple[List[int], List[int], List[dict]]:
         prompt_ids = cast(Any, attrs.get("prompt_token_ids") or [])
         resp_ids = cast(Any, attrs.get("response_token_ids") or [])
+        resp_probs = cast(Any, attrs.get("response_logprobs") or [])
         prompt_ids = self._literal_eval_maybe(prompt_ids)
         resp_ids = self._literal_eval_maybe(resp_ids)
+        resp_probs = self._literal_eval_maybe(resp_probs)
         if not (isinstance(prompt_ids, list) and all(isinstance(x, int) for x in prompt_ids)):  # type: ignore
             prompt_ids = []
         if not (isinstance(resp_ids, list) and all(isinstance(x, int) for x in resp_ids)):  # type: ignore
             resp_ids = []
-        return cast(List[int], prompt_ids), cast(List[int], resp_ids)
+        if not (isinstance(resp_probs, list) and all(isinstance(x, (dict)) for x in resp_probs)):  # type: ignore
+            resp_probs = []
+        return cast(List[int], prompt_ids), cast(List[int], resp_ids), cast(List[dict], resp_probs)
 
     def _maybe_reward_value(self, span: Span) -> Optional[float]:
         """Parse reward from typical AgentOps payloads or explicit reward spans."""
@@ -970,10 +980,10 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
             resp_ids: List[int] = []
 
             if s.name == "raw_gen_ai_request":
-                prompt_ids, resp_ids = self._extract_tokens_from_raw(attrs)
+                prompt_ids, resp_ids, res_logprobs = self._extract_tokens_from_raw(attrs)
             elif s.name == "litellm_request":
                 # Some proxies never include token ids here. Ignore unless present.
-                prompt_ids, resp_ids = self._extract_tokens_from_openai(attrs)
+                prompt_ids, resp_ids, res_logprobs = self._extract_tokens_from_openai(attrs)
 
             if prompt_ids and resp_ids:
                 rid = self._request_id_from_attrs(attrs)
@@ -988,6 +998,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                         seq=s.sequence_id,
                         response_ids=resp_ids,
                         prompt_ids=prompt_ids,
+                        response_logprobs=res_logprobs,
                         request_id=rid,
                     )
                 )
@@ -1025,6 +1036,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                     reward=assigned.get(s.span_id, None),
                     metadata=dict(
                         # This is called response_id to align with the other adapters.
+                        response={"logprobs": item["response_logprobs"]},
                         response_id=item["request_id"],
                     ),
                 )

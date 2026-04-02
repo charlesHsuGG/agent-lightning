@@ -1163,7 +1163,7 @@ class LLMProxy:
 
         self.callbacks: List[Type[CustomLogger]] = []
         if callbacks is None:
-            callbacks = ["return_token_ids", "opentelemetry"]
+            callbacks = ["return_token_ids", "opentelemetry", "logprobs"]
         for callback in callbacks:
             if isinstance(callback, str):
                 if callback not in _CALLBACK_REGISTRY:
