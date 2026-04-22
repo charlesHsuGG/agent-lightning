@@ -16,8 +16,10 @@ __all__ = [
 
 
 class ChatCompletionResponsePatched(ChatCompletionResponse):
+    prompt_messages: List[Dict[str, Any]] | None = None
     prompt_token_ids: List[int] | None = None
     response_token_ids: List[int] | None = None
+    response_logprobs: List[Dict[str, float]] | None = None
 
 
 original_chat_completion_full_generator = OpenAIServingChat.chat_completion_full_generator
@@ -57,6 +59,8 @@ async def chat_completion_full_generator(
         update={
             "prompt_token_ids": prompt_token_ids,
             "response_token_ids": response_token_ids[0],
+            "prompt_messages": request.messages,
+            "response_logprobs": response.choices[0].logprobs.content if response.choices[0].logprobs else None,
         }
     )
 

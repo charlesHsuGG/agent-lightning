@@ -32,6 +32,61 @@ __all__ = [
 ]
 
 
+def extract_prompt_image_urls(prompt_raw_content: Any) -> List[str]:
+    """Extract image URLs from the span attributes, in order of appearance.
+
+    Args:
+        prompt_raw_content: The raw content of the prompt, which can be in one of several formats:
+
+            - List[dict]: A list of message entries, each being a dict with at least a "content" key.
+            - Dict[str, Any]: A dictionary, often with numeric string keys (e.g., `{"0": {...}, "1": {...}}`), where each value is a message entry.
+                If the dict does not have numeric keys, it is treated as a single message entry.
+    """
+    message_entries: List[Any] = []
+    if isinstance(prompt_raw_content, list):
+        message_entries = cast(List[Any], prompt_raw_content)
+    elif isinstance(prompt_raw_content, dict):
+        # Common when the attributes expand to {"0": {...}, "prompt_filter_results": ...}
+        numeric_keys = [
+            key
+            for key in cast(Dict[str, Any], prompt_raw_content).keys()
+            if isinstance(key, str) and key.isdigit()  # pyright: ignore[reportUnnecessaryIsInstance]
+        ]
+        if numeric_keys:
+            for key in sorted(numeric_keys, key=int):
+                message_entries.append(prompt_raw_content[key])
+        else:
+            message_entries = [prompt_raw_content]
+    else:
+        return []
+
+    image_urls: List[str] = []
+    for message in cast(List[Dict[str, Any]], message_entries):
+        if (
+            not isinstance(message, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or "content" not in message
+        ):
+            continue
+        content = message["content"]
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)  # This content should now be a list
+            except json.JSONDecodeError:
+                logger.debug(f"Failed to parse message content as JSON: {content}")
+                continue
+        if isinstance(content, list):
+            for content_part in cast(List[Dict[str, Any]], content):
+                if not isinstance(content_part, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+                    continue
+                if content_part.get("type") == "image_url":
+                    image_url_dict = cast(Dict[str, Any], content_part.get("image_url"))
+                    if not isinstance(image_url_dict, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+                        continue
+                    if "url" in image_url_dict:
+                        image_urls.append(image_url_dict["url"])
+    return image_urls
+
+
 def ids_startswith(
     full_ids: List[int], prefix_ids: List[int], tokenizer: Any, debug: bool = False
 ) -> Tuple[bool, Tuple[bool, bool, bool]]:
@@ -840,14 +895,16 @@ class AgentModeDaemon:
             # The client should report triplets that contain prompt_ids and response_ids.
             # Example triplet.prompt: {"token_ids": [...], "image_urls": [...]}
             # Example triplet.response: {"token_ids": [...]}
+            prompt_raw_content = t.prompt.get("raw_content", [])
             trace_list = [
                 {
                     "prompt_ids": t.prompt.get("token_ids", []),
                     "response_ids": t.response.get("token_ids", []),
-                    "image_urls": t.prompt.get("image_urls", []),
                     "rollout_log_probs": [
                         log_prob.get("log_prob", 0.0) for log_prob in t.metadata.response.get("log_probs", [])
                     ] if hasattr(t.metadata, "response") and t.metadata.response and t.metadata.response.get("log_probs") else [],
+                    "prompt_raw_content": prompt_raw_content,
+                    "image_urls": extract_prompt_image_urls(prompt_raw_content) if prompt_raw_content else [],
                 }
                 for t in rollout.triplets
             ]
@@ -878,6 +935,7 @@ class AgentModeDaemon:
         rollout_id_list: List[str] = []
         turn_index_list: List[int] = []
         is_drop_list: List[bool] = []
+        raw_prompt_list: List[dict] = []
         image_grid_thw_list: List[Optional[torch.Tensor]] = []  # For Qwen2-VL mrope
         n_trunc_sample_because_of_response = 0
 
@@ -887,6 +945,7 @@ class AgentModeDaemon:
 
                     reward_list.append(sample_info["reward"])
                     prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
+                    raw_prompt = trace.get("prompt_raw_content", [])
 
                     # Mark samples with prompts exceeding max_prompt_length to be dropped later
                     if len(prompt_ids) > max_prompt_length:
@@ -908,6 +967,7 @@ class AgentModeDaemon:
                         response_ids, max_response_length, self.pad_token_id
                     )
 
+                    raw_prompt_list.append(raw_prompt)  # For debugging, to check the raw prompt and response before padding and truncation
                     input_ids_list.append(one_input_ids)
                     input_attention_mask_list.append(one_input_attention_mask)
                     response_ids_list.append(one_response_ids)
@@ -974,6 +1034,8 @@ class AgentModeDaemon:
                 # Merge all trace segments in merged_trace_idx into training samples
                 for current_merged_trace_idx in merged_trace_idx:
                     prompt_ids = sample_info["trace_list"][current_merged_trace_idx[0]]["prompt_ids"]
+                    raw_prompt = sample_info["trace_list"][current_merged_trace_idx[0]]["prompt_raw_content"]
+                    image_grid_thw = self._get_image_grid_thw(trace.get("image_urls", [])) if self._use_mrope else None
 
                     # if the merged_trace_idx doesn't start with the beginning of the prompt_ids, we need to adjust it
                     if current_merged_trace_idx[0] > 0 and len(prompt_ids) > max_prompt_length:
@@ -1021,6 +1083,7 @@ class AgentModeDaemon:
                         response_mask, max_response_length, 0
                     )
 
+                    raw_prompt_list.append(raw_prompt)  # For debugging, to check the raw prompt and response before padding and truncation
                     input_ids_list.append(one_input_ids)
                     input_attention_mask_list.append(one_input_attention_mask)
                     response_ids_list.append(one_response_ids)
@@ -1028,6 +1091,8 @@ class AgentModeDaemon:
                     response_mask_list.append(one_response_mask)
                     data_id_list.append(sample_info["data_id"])
                     rollout_id_list.append(rollout_id)
+                    if image_grid_thw is not None:
+                        image_grid_thw_list.append(image_grid_thw)
                     # turn_index_list.append(current_merged_trace_idx)
         else:
             raise ValueError(f"Unknown trace_aggregator level: {self.trace_aggregator.get('level')}")
@@ -1098,7 +1163,7 @@ class AgentModeDaemon:
             },  # type: ignore
             batch_size=n_transition,
         )
-        data_proto = DataProto(batch=batch)
+        data_proto = DataProto(batch=batch, non_tensor_batch={"raw_prompt": np.array(raw_prompt_list, dtype=object)})  # type: ignore
 
         data_metrics = {
             "training/reward": np.mean(list(finished_id_to_final_reward.values())),
