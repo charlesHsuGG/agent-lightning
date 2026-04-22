@@ -22,16 +22,11 @@ original_set_attributes = OpenTelemetry.set_attributes  # type: ignore
 
 def patched_set_attributes(self: Any, span: Any, kwargs: Any, response_obj: Optional[Any]):
     original_set_attributes(self, span, kwargs, response_obj)
-    print(f"Patched set_attributes called with response_obj: {response_obj}")
     # Add custom attributes
-    if response_obj is not None and response_obj.get("prompt_messages"):
-        span.set_attribute("prompt_messages", list(response_obj.get("prompt_messages")))
     if response_obj is not None and response_obj.get("prompt_token_ids"):
         span.set_attribute("prompt_token_ids", list(response_obj.get("prompt_token_ids")))
     if response_obj is not None and response_obj.get("response_token_ids"):
-        span.set_attribute("response_token_ids", list(response_obj.get("response_token_ids")))
-    if response_obj is not None and response_obj.get("response_logprobs"):
-        span.set_attribute("response_logprobs", list(response_obj.get("response_logprobs")))
+        span.set_attribute("response_token_ids", list(response_obj.get("response_token_ids")[0]))
 
 
 def instrument_litellm():
