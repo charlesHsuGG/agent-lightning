@@ -18,7 +18,6 @@ from codetiming import Timer
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from verl import DataProto
-from verl.trainer.ppo.reward import extract_reward
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import _compute_response_info, compute_throughout_metrics, compute_timing_metrics
@@ -308,19 +307,29 @@ class AgentLightningTrainer(RayPPOTrainer):
             with _timer("reward", timing_raw):
                 # compute reward model score
                 if self.use_rm and "rm_scores" not in batch.batch.keys():
-                    batch_reward = self._compute_reward_colocate(batch)
-                    batch = batch.union(batch_reward)
+                    if hasattr(self, "_compute_reward_colocate"):
+                        from verl.trainer.ppo.reward import extract_reward
 
-                reward_tensor, reward_extra_infos_dict = extract_reward(batch)
-                self_distillation_data = self._maybe_build_self_distillation_batch(
-                    batch,
-                    reward_tensor,
-                    reward_extra_infos_dict,
-                )
-                if self_distillation_data is not None:
-                    self_distillation_batch, self_distillation_metrics = self_distillation_data
-                    batch = batch.union(self_distillation_batch)
-                    metrics.update(self_distillation_metrics)
+                        batch_reward = self._compute_reward_colocate(batch)
+                        batch = batch.union(batch_reward)
+
+                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                    else:
+                        reward_tensor = self.rm_wg.compute_rm_score(batch)
+                        batch = batch.union(reward_tensor)
+
+                        reward_extra_infos_dict = {}
+
+                if hasattr(self, "_maybe_build_self_distillation_batch"):
+                    self_distillation_data = self._maybe_build_self_distillation_batch(
+                        batch,
+                        reward_tensor,
+                        reward_extra_infos_dict,
+                    )
+                    if self_distillation_data is not None:
+                        self_distillation_batch, self_distillation_metrics = self_distillation_data
+                        batch = batch.union(self_distillation_batch)
+                        metrics.update(self_distillation_metrics)
 
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
             batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
