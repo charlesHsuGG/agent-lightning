@@ -575,60 +575,6 @@ class TraceTree:
 
         return rewards
 
-    def extract_prompt_image_urls(self, prompt_raw_content: Any) -> List[str]:
-        """Extract image URLs from the span attributes, in order of appearance.
-
-        Args:
-            prompt_raw_content: The raw content of the prompt, which can be in one of several formats:
-
-                - List[dict]: A list of message entries, each being a dict with at least a "content" key.
-                - Dict[str, Any]: A dictionary, often with numeric string keys (e.g., `{"0": {...}, "1": {...}}`), where each value is a message entry.
-                  If the dict does not have numeric keys, it is treated as a single message entry.
-        """
-        message_entries: List[Any] = []
-        if isinstance(prompt_raw_content, list):
-            message_entries = cast(List[Any], prompt_raw_content)
-        elif isinstance(prompt_raw_content, dict):
-            # Common when the attributes expand to {"0": {...}, "prompt_filter_results": ...}
-            numeric_keys = [
-                key
-                for key in cast(Dict[str, Any], prompt_raw_content).keys()
-                if isinstance(key, str) and key.isdigit()  # pyright: ignore[reportUnnecessaryIsInstance]
-            ]
-            if numeric_keys:
-                for key in sorted(numeric_keys, key=int):
-                    message_entries.append(prompt_raw_content[key])
-            else:
-                message_entries = [prompt_raw_content]
-        else:
-            return []
-
-        image_urls: List[str] = []
-        for message in cast(List[Dict[str, Any]], message_entries):
-            if (
-                not isinstance(message, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
-                or "content" not in message
-            ):
-                continue
-            content = message["content"]
-            if isinstance(content, str):
-                try:
-                    content = json.loads(content)  # This content should now be a list
-                except json.JSONDecodeError:
-                    logger.debug(f"Failed to parse message content as JSON: {content}")
-                    continue
-            if isinstance(content, list):
-                for content_part in cast(List[Dict[str, Any]], content):
-                    if not isinstance(content_part, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
-                        continue
-                    if content_part.get("type") == "image_url":
-                        image_url_dict = cast(Dict[str, Any], content_part.get("image_url"))
-                        if not isinstance(image_url_dict, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
-                            continue
-                        if "url" in image_url_dict:
-                            image_urls.append(image_url_dict["url"])
-        return image_urls
-
     def span_to_triplet(self, span: Span, agent_name: str) -> Triplet:
         """Convert a span to a triplet.
 
@@ -675,15 +621,9 @@ class TraceTree:
             response_metadata.pop("prompt_token_ids", None)
             response_metadata.pop("response_token_ids", None)
 
-        prompt_raw_content = _attributes_unflatten_multiple(
-            span.attributes, ["gen_ai.prompt", "agentlightning.operation.input.messages"]
-        )
-        completion_raw_content = _attributes_unflatten_multiple(
-            span.attributes, ["gen_ai.completion", "agentlightning.operation.output.choices"]
-        )
-        image_urls = self.extract_prompt_image_urls(prompt_raw_content)
-        prompt_payload = {"token_ids": prompt_token_ids, "raw_content": prompt_raw_content, "image_urls": image_urls}
-        response_payload = {"token_ids": response_token_ids, "raw_content": completion_raw_content}
+        prompt_raw_content = _attributes_unflatten_multiple(span.attributes, ["gen_ai.prompt", "agentlightning.operation.input.messages"])
+        prompt_payload = {"token_ids": prompt_token_ids, "raw_content": prompt_raw_content}
+        response_payload = {"token_ids": response_token_ids}
 
         # FIXME: logprob doesn't support Weave tracer yet.
         logprobs_content = span.attributes.get("logprobs.content", None)  # type: ignore
@@ -892,6 +832,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
     def _extract_tokens_from_raw(self, attrs: Dict[str, Any]) -> Tuple[List[int], List[int], List[dict]]:
         """Extract token ids from raw_gen_ai_request attributes.
 
+        - llm.hosted_vllm.messages: string -> List[dict] -> extract content -> List[dict] -> extract token_ids
         - llm.hosted_vllm.prompt_token_ids: string -> List[int]
         - llm.hosted_vllm.response_token_ids: string -> List[List[int]] -> take first
         - llm.hosted_vllm.choices: string -> [{'token_ids': [...]}] -> take first
@@ -899,6 +840,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
         prompt_ids: List[int] = []
         resp_ids: List[int] = []
         resp_probs: List[float] = []
+        prompt_raw_content: List[dict] = []
 
         # prompt
         p = attrs.get("llm.hosted_vllm.prompt_token_ids")
@@ -914,38 +856,48 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
             if all(isinstance(x, int) for x in first):
                 resp_ids = cast(List[int], first)
 
+        # messages path (vLLM-based proxies)
+        msgs = attrs.get("llm.hosted_vllm.messages")
+        msgs = self._literal_eval_maybe(msgs)
+        if isinstance(msgs, list) and all(isinstance(x, dict) for x in msgs):  # type: ignore
+            prompt_raw_content = cast(List[dict], msgs)
+
         # fallback via choices
-        if not resp_ids:
-            choices = attrs.get("llm.hosted_vllm.choices")
-            choices = self._literal_eval_maybe(choices)
-            if isinstance(choices, list) and choices:
-                cand = cast(Any, choices[0])
-                if isinstance(cand, dict):
-                    tids = cast(Dict[str, Any], cand).get("token_ids")
+        resp_choices = attrs.get("llm.hosted_vllm.choices")
+        resp_choices = self._literal_eval_maybe(resp_choices)
+        if isinstance(resp_choices, list) and resp_choices:
+            cand = cast(Any, resp_choices[0])
+            if isinstance(cand, dict):
+                logsprobs = cast(Dict[str, Any], cand).pop("logprobs", {}).get("content")
+                if isinstance(logsprobs, list):
+                    logsprobs = self._literal_eval_maybe(logsprobs)
+                    if isinstance(logsprobs, list) and all(isinstance(x, (dict)) for x in logsprobs):  # type: ignore
+                        resp_probs = cast(List[dict], logsprobs)
+                if not resp_ids:
+                    tids = cast(Dict[str, Any], cand).pop("token_ids")
                     if isinstance(tids, list) and all(isinstance(x, int) for x in tids):  # type: ignore
                         resp_ids = cast(List[int], tids)
-                    logsprobs = cast(Dict[str, Any], cand).get("logprobs", {}).get("content")
-                    if isinstance(logsprobs, list):
-                        logsprobs = self._literal_eval_maybe(logsprobs)
-                        if isinstance(logsprobs, list) and all(isinstance(x, (dict)) for x in logsprobs):  # type: ignore
-                            resp_probs = cast(List[dict], logsprobs)
 
-        return prompt_ids, resp_ids, resp_probs
+        return prompt_ids, resp_ids, resp_probs, prompt_raw_content
 
     def _extract_tokens_from_openai(self, attrs: Dict[str, Any]) -> Tuple[List[int], List[int], List[dict]]:
+        prompt_raw_content = cast(Any, attrs.get("prompt_messages") or [])
         prompt_ids = cast(Any, attrs.get("prompt_token_ids") or [])
         resp_ids = cast(Any, attrs.get("response_token_ids") or [])
         resp_probs = cast(Any, attrs.get("response_logprobs") or [])
+        prompt_raw_content = self._literal_eval_maybe(prompt_raw_content)
         prompt_ids = self._literal_eval_maybe(prompt_ids)
         resp_ids = self._literal_eval_maybe(resp_ids)
         resp_probs = self._literal_eval_maybe(resp_probs)
+        if not (isinstance(prompt_raw_content, list) and all(isinstance(x, dict) for x in prompt_raw_content)):  # type: ignore
+            prompt_raw_content = []
         if not (isinstance(prompt_ids, list) and all(isinstance(x, int) for x in prompt_ids)):  # type: ignore
             prompt_ids = []
         if not (isinstance(resp_ids, list) and all(isinstance(x, int) for x in resp_ids)):  # type: ignore
             resp_ids = []
         if not (isinstance(resp_probs, list) and all(isinstance(x, (dict)) for x in resp_probs)):  # type: ignore
             resp_probs = []
-        return cast(List[int], prompt_ids), cast(List[int], resp_ids), cast(List[dict], resp_probs)
+        return cast(List[int], prompt_ids), cast(List[int], resp_ids), cast(List[dict], resp_probs), cast(List[dict], prompt_raw_content)
 
     def _maybe_reward_value(self, span: Span) -> Optional[float]:
         """Parse reward from typical AgentOps payloads or explicit reward spans."""
@@ -980,10 +932,10 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
             resp_ids: List[int] = []
 
             if s.name == "raw_gen_ai_request":
-                prompt_ids, resp_ids, res_logprobs = self._extract_tokens_from_raw(attrs)
+                prompt_ids, resp_ids, res_logprobs, prompt_raw_content = self._extract_tokens_from_raw(attrs)
             elif s.name == "litellm_request":
                 # Some proxies never include token ids here. Ignore unless present.
-                prompt_ids, resp_ids, res_logprobs = self._extract_tokens_from_openai(attrs)
+                prompt_ids, resp_ids, res_logprobs, prompt_raw_content = self._extract_tokens_from_openai(attrs)
 
             if prompt_ids and resp_ids:
                 rid = self._request_id_from_attrs(attrs)
@@ -1000,6 +952,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                         prompt_ids=prompt_ids,
                         response_logprobs=res_logprobs,
                         request_id=rid,
+                        prompt_raw_content=prompt_raw_content,
                     )
                 )
 
@@ -1029,9 +982,10 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
         triplets: List[Triplet] = []
         for item in llm_items:
             s = item["span"]
+            prompt_raw_content = item["prompt_raw_content"]
             triplets.append(
                 Triplet(
-                    prompt={"token_ids": item["prompt_ids"]},
+                    prompt={"token_ids": item["prompt_ids"], "raw_content": prompt_raw_content},
                     response={"token_ids": item["response_ids"]},
                     reward=assigned.get(s.span_id, None),
                     metadata=dict(

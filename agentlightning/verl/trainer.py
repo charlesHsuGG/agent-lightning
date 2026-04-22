@@ -193,8 +193,9 @@ class AgentLightningTrainer(RayPPOTrainer):
 
         test_data = next(iter(self.val_dataloader))
         test_batch = DataProto.from_single_dict(test_data)
-
-        self.async_rollout_manager.wake_up()
+        
+        if hasattr(self.async_rollout_manager, "wake_up"):
+            self.async_rollout_manager.wake_up()
         self.agent_mode_daemon.set_up_data_and_server(
             test_batch.non_tensor_batch,
             self.async_rollout_manager.server_addresses,
@@ -203,7 +204,8 @@ class AgentLightningTrainer(RayPPOTrainer):
         self.agent_mode_daemon.run_until_all_finished()
         test_metrics = self.agent_mode_daemon.get_test_metrics()
         self.agent_mode_daemon.clear_data_and_server()
-        self.async_rollout_manager.sleep()
+        if hasattr(self.async_rollout_manager, "sleep"):
+            self.async_rollout_manager.sleep()
         return test_metrics
 
     def _compute_reference_log_prob(self, batch: DataProto) -> DataProto:
@@ -250,7 +252,8 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # generate a batch
             with _timer("gen", timing_raw):
-                self.async_rollout_manager.wake_up()
+                if hasattr(self.async_rollout_manager, "wake_up"):
+                    self.async_rollout_manager.wake_up()
                 self.agent_mode_daemon.set_up_data_and_server(
                     gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses
                 )
@@ -271,7 +274,8 @@ class AgentLightningTrainer(RayPPOTrainer):
                 )
                 metrics.update(agent_metrics)
                 self.agent_mode_daemon.clear_data_and_server()
-                self.async_rollout_manager.sleep()
+                if hasattr(self.async_rollout_manager, "sleep"):
+                    self.async_rollout_manager.sleep()
 
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
@@ -304,11 +308,30 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             with _timer("reward", timing_raw):
                 # compute reward model score
-                if self.use_rm:
-                    reward_tensor = self.rm_wg.compute_rm_score(batch)
-                    batch = batch.union(reward_tensor)
+                if self.use_rm and "rm_scores" not in batch.batch.keys():
+                    if hasattr(self, "_compute_reward_colocate"):
+                        from verl.trainer.ppo.reward import extract_reward
 
-                reward_extra_infos_dict = {}
+                        batch_reward = self._compute_reward_colocate(batch)
+                        batch = batch.union(batch_reward)
+
+                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                    else:
+                        reward_tensor = self.rm_wg.compute_rm_score(batch)
+                        batch = batch.union(reward_tensor)
+
+                        reward_extra_infos_dict = {}
+
+                if hasattr(self, "_maybe_build_self_distillation_batch"):
+                    self_distillation_data = self._maybe_build_self_distillation_batch(
+                        batch,
+                        reward_tensor,
+                        reward_extra_infos_dict,
+                    )
+                    if self_distillation_data is not None:
+                        self_distillation_batch, self_distillation_metrics = self_distillation_data
+                        batch = batch.union(self_distillation_batch)
+                        metrics.update(self_distillation_metrics)
 
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
             batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)

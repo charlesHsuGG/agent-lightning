@@ -603,7 +603,7 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
                 if "custom_params" in body_json:
                     user_info = body_json.get("custom_params", {}).pop("user_info", {})
                     if "user_id" in user_info and "thread_id" in user_info:
-                        attempt_id, rollout_id = user_info.get("user_id"), user_info.get("thread_id")
+                        rollout_id, attempt_id = user_info.get("user_id"), user_info.get("thread_id")
                         store = get_active_llm_proxy().get_store()
                         if store is not None:
                             # Allocate a monotonic sequence id per (rollout, attempt).

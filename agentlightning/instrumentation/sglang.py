@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import warnings
-from typing import List, Union
+from typing import List, Union, Dict
 
 import sglang
 from fastapi import Request
@@ -20,8 +20,10 @@ __all__ = [
 
 
 class ChatCompletionResponsePatched(ChatCompletionResponse):
+    prompt_messages: List[Dict[str, Any]] | None = None
     prompt_token_ids: List[int] | None = None
     response_token_ids: List[int] | None = None
+    response_logprobs: List[Dict[str, float]] | None = None
 
 
 original_handle_non_streaming_request = OpenAIServingChat._handle_non_streaming_request
@@ -46,8 +48,10 @@ async def _handle_non_streaming_request(
 
     response = response.model_copy(
         update={
+            "prompt_messages": request.messages,
             "prompt_token_ids": adapted_request.input_ids,
             "response_token_ids": response_token_ids,
+            "response_logprobs": response.choices[0].logprobs.content if response.choices[0].logprobs else None,
         }
     )
 
