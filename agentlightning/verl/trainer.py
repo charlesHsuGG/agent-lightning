@@ -193,8 +193,9 @@ class AgentLightningTrainer(RayPPOTrainer):
 
         test_data = next(iter(self.val_dataloader))
         test_batch = DataProto.from_single_dict(test_data)
-
-        self.async_rollout_manager.wake_up()
+        
+        if hasattr(self.async_rollout_manager, "wake_up"):
+            self.async_rollout_manager.wake_up()
         self.agent_mode_daemon.set_up_data_and_server(
             test_batch.non_tensor_batch,
             self.async_rollout_manager.server_addresses,
@@ -203,7 +204,8 @@ class AgentLightningTrainer(RayPPOTrainer):
         self.agent_mode_daemon.run_until_all_finished()
         test_metrics = self.agent_mode_daemon.get_test_metrics()
         self.agent_mode_daemon.clear_data_and_server()
-        self.async_rollout_manager.sleep()
+        if hasattr(self.async_rollout_manager, "sleep"):
+            self.async_rollout_manager.sleep()
         return test_metrics
 
     def _compute_reference_log_prob(self, batch: DataProto) -> DataProto:
