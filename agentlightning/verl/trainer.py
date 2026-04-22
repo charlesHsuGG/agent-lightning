@@ -251,7 +251,8 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # generate a batch
             with _timer("gen", timing_raw):
-                # self.async_rollout_manager.wake_up()
+                if hasattr(self.async_rollout_manager, "wake_up"):
+                    self.async_rollout_manager.wake_up()
                 self.agent_mode_daemon.set_up_data_and_server(
                     gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses
                 )
@@ -272,7 +273,8 @@ class AgentLightningTrainer(RayPPOTrainer):
                 )
                 metrics.update(agent_metrics)
                 self.agent_mode_daemon.clear_data_and_server()
-                # self.async_rollout_manager.sleep()
+                if hasattr(self.async_rollout_manager, "sleep"):
+                    self.async_rollout_manager.sleep()
 
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
