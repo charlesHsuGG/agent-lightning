@@ -13,7 +13,6 @@ from typing import Any, Dict, Type
 import torch
 import numpy as np
 from tqdm import tqdm
-from omegaconf import OmegaConf
 import verl
 from verl import DataProto
 from verl.trainer.ppo.utils import Role
@@ -32,7 +31,6 @@ from verl.trainer.ppo.ray_trainer import (
     compute_response_mask,
 )
 from verl.utils.metric import reduce_metrics
-from verl.utils.tracking import Tracking
 
 from agentlightning.adapter import TraceAdapter, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy
@@ -187,9 +185,6 @@ class AgentLightningTrainer(RayPPOTrainer):
 
         test_data = next(iter(self.val_dataloader))
         test_batch = DataProto.from_single_dict(test_data)
-        
-        if hasattr(self.async_rollout_manager, "wake_up"):
-            self.async_rollout_manager.wake_up()
         self.agent_mode_daemon.set_up_data_and_server(
             test_batch.non_tensor_batch,
             self.async_rollout_manager.server_addresses,
@@ -198,41 +193,7 @@ class AgentLightningTrainer(RayPPOTrainer):
         self.agent_mode_daemon.run_until_all_finished()
         test_metrics = self.agent_mode_daemon.get_test_metrics()
         self.agent_mode_daemon.clear_data_and_server()
-        if hasattr(self.async_rollout_manager, "sleep"):
-            self.async_rollout_manager.sleep()
         return test_metrics
-
-    def _compute_reference_log_prob(self, batch: DataProto) -> DataProto:
-        """Compute reference log probability using the correct worker based on LoRA configuration.
-
-        In verl 0.6.0+, when LoRA is detected (indicated by ref_in_actor=True),
-        the reference policy is computed by the actor rollout worker instead of a separate
-        ref policy worker. This method handles both scenarios by checking the ref_in_actor flag.
-        Note: verl sets ref_in_actor=True when it detects LoRA configuration (e.g., lora_rank > 0 or lora_adapter_path is set).
-
-        Args:
-            batch: The data batch to compute reference log probabilities for.
-            curr_step_profile: Whether the current step is a profiling step.
-
-        Returns:
-            DataProto with reference log probabilities added.
-
-        Raises:
-            RuntimeError: If the required worker is not available.
-        """
-        if getattr(self, "ref_in_actor", False):
-            actor_worker = getattr(self, "actor_rollout_wg", None)
-            if actor_worker is None:
-                raise RuntimeError("actor_rollout_wg is required when ref_in_actor is True.")
-            return actor_worker.compute_ref_log_prob(batch)
-
-        ref_worker = getattr(self, "ref_policy_wg", None)
-        if ref_worker is None:
-            raise RuntimeError(
-                "Reference policy worker was not initialized. "
-                "Ensure `use_reference_policy` is enabled and the VERL config exposes the ref worker."
-            )
-        return ref_worker.compute_ref_log_prob(batch)
 
     def _train_step(self, batch_dict: dict, curr_step_profile: bool = False, is_last_step: bool = False) -> dict:
         # Isolate in a separate method to automatically recycle the variables before validation.
@@ -247,9 +208,7 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # generate a batch
             with marked_timer("gen", timing_raw, color="red"):
-                if hasattr(self.async_rollout_manager, "wake_up"):
-                    self.async_rollout_manager.wake_up()
-                if curr_step_profile and hasattr(self.async_rollout_manager, "start_profile"):
+                if curr_step_profile:
                     self.async_rollout_manager.start_profile()
                 self.agent_mode_daemon.set_up_data_and_server(
                     gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses
@@ -271,49 +230,37 @@ class AgentLightningTrainer(RayPPOTrainer):
                 )
                 metrics.update(agent_metrics)
                 self.agent_mode_daemon.clear_data_and_server()
-                if hasattr(self.async_rollout_manager, "sleep"):
-                    self.async_rollout_manager.sleep()
-                if hasattr(self, "checkpoint_manager") and hasattr(self.checkpoint_manager, "sleep_replicas"):
-                    self.checkpoint_manager.sleep_replicas()
-                if curr_step_profile and hasattr(self.async_rollout_manager, "stop_profile"):
+                self.checkpoint_manager.sleep_replicas()
+                if curr_step_profile:
                     self.async_rollout_manager.stop_profile()
 
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with marked_timer("gen_max", timing_raw, color="purple"):
                     gen_baseline_batch = deepcopy(gen_batch)
                     gen_baseline_batch.meta_info["do_sample"] = False
-                    if curr_step_profile and hasattr(self.async_rollout_manager, "start_profile"):
+                    if curr_step_profile:
                         self.async_rollout_manager.start_profile()
                     gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                    if hasattr(self, "checkpoint_manager") and hasattr(self.checkpoint_manager, "sleep_replicas"):
-                        self.checkpoint_manager.sleep_replicas()
-                    if curr_step_profile and hasattr(self.async_rollout_manager, "stop_profile"):
+                    self.checkpoint_manager.sleep_replicas()
+                    if curr_step_profile:
                         self.async_rollout_manager.stop_profile()
 
                     batch = batch.union(gen_baseline_output)
 
                     if self.use_rm and "rm_scores" not in batch.batch.keys():
-                        if hasattr(self, "_compute_reward_colocate"):
-                            batch_reward = self._compute_reward_colocate(batch)
-                            batch = batch.union(batch_reward)
+                        batch_reward = self._compute_reward_colocate(batch)
+                        batch = batch.union(batch_reward)
 
-                            # Compute or extract reward for REMAX baseline
-                            reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
+                        # Compute or extract reward for REMAX baseline
+                        reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
 
-                            keys_to_pop = set(gen_baseline_output.batch.keys())
-                            if batch_reward is not None:
-                                keys_to_pop.update(batch_reward.batch.keys())
-                            batch.pop(batch_keys=list(keys_to_pop))
+                        keys_to_pop = set(gen_baseline_output.batch.keys())
+                        if batch_reward is not None:
+                            keys_to_pop.update(batch_reward.batch.keys())
+                        batch.pop(batch_keys=list(keys_to_pop))
 
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
-                            del batch_reward
-                        else:
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
+                        batch.batch["reward_baselines"] = reward_baseline_tensor
+                        del batch_reward
 
                     del gen_baseline_batch, gen_baseline_output
 
@@ -333,18 +280,12 @@ class AgentLightningTrainer(RayPPOTrainer):
             with marked_timer("reward", timing_raw, color="yellow"):
                 # compute reward model score
                 if self.use_rm and "rm_scores" not in batch.batch.keys():
-                    if hasattr(self, "_compute_reward_colocate"):
-                        from verl.trainer.ppo.reward import extract_reward
+                    from verl.trainer.ppo.reward import extract_reward
 
-                        batch_reward = self._compute_reward_colocate(batch)
-                        batch = batch.union(batch_reward)
+                    batch_reward = self._compute_reward_colocate(batch)
+                    batch = batch.union(batch_reward)
 
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
-                    else:
-                        reward_tensor = self.rm_wg.compute_rm_score(batch)
-                        batch = batch.union(reward_tensor)
-
-                        reward_extra_infos_dict = {}
+                    reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                 if hasattr(self, "_maybe_build_self_distillation_batch"):
                     self_distillation_data = self._maybe_build_self_distillation_batch(
@@ -413,16 +354,13 @@ class AgentLightningTrainer(RayPPOTrainer):
             if self.use_reference_policy:
                 # compute reference log_prob
                 with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                    ref_log_prob = self._compute_reference_log_prob(batch)
+                    ref_log_prob = self._compute_ref_log_prob(batch)
                     batch = batch.union(ref_log_prob)
 
             # compute values
             if self.use_critic:
                 with marked_timer("values", timing_raw, color="cyan"):
-                    if hasattr(self, "_compute_values"):
-                        values = self._compute_values(batch)
-                    else:
-                        values = self.critic_wg.compute_values(batch)
+                    values = self._compute_values(batch)
                     batch = batch.union(values)
 
             # for agent mode, unpad to calculate adv
@@ -511,10 +449,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             # update critic
             if self.use_critic:
                 with marked_timer("update_critic", timing_raw, color="pink"):
-                    if hasattr(self, "_update_critic"):
-                        critic_output = self._update_critic(batch)
-                    else:
-                        critic_output = self.critic_wg.update_critic(batch)
+                    critic_output = self._update_critic(batch)
                 critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                 metrics.update(critic_output_metrics)
 
@@ -523,10 +458,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                 # update actor
                 with marked_timer("update_actor", timing_raw, color="red"):
                     batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                    if hasattr(self, "_update_actor"):
-                        actor_output = self._update_actor(batch)
-                    else:
-                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                    actor_output = self._update_actor(batch)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
@@ -552,9 +484,8 @@ class AgentLightningTrainer(RayPPOTrainer):
                         self._save_checkpoint()
 
                 # update weights from trainer to rollout
-                if hasattr(self, "checkpoint_manager") and hasattr(self.checkpoint_manager, "update_weights"):
-                    with marked_timer("update_weights", timing_raw, color="red"):
-                        self.checkpoint_manager.update_weights(self.global_steps)
+                with marked_timer("update_weights", timing_raw, color="red"):
+                    self.checkpoint_manager.update_weights(self.global_steps)
 
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                 metrics.update(actor_output_metrics)
@@ -581,6 +512,16 @@ class AgentLightningTrainer(RayPPOTrainer):
         return metrics
 
     def fit(self):
+        """
+        The training loop of PPO.
+        The driver process only need to call the compute functions of the worker group through RPC
+        to construct the PPO dataflow.
+        The light-weight advantage computation is done on the driver process.
+        """
+        from omegaconf import OmegaConf
+
+        from verl.utils.tracking import Tracking
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -592,6 +533,7 @@ class AgentLightningTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)
 
         assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
         if self.adapter is not None and not isinstance(self.adapter, TraceToTripletBase):
@@ -626,9 +568,11 @@ class AgentLightningTrainer(RayPPOTrainer):
         )
         self.agent_mode_daemon.start()
 
+        current_epoch = self.global_steps // len(self.train_dataloader)
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -656,7 +600,7 @@ class AgentLightningTrainer(RayPPOTrainer):
         )
         next_step_profile = False
 
-        for epoch in range(self.config.trainer.total_epochs):
+        for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -666,22 +610,19 @@ class AgentLightningTrainer(RayPPOTrainer):
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
-                if hasattr(self, "_start_profiling"):
-                    with marked_timer("start_profile", timing_raw):
-                        self._start_profiling(
-                            not prev_step_profile and curr_step_profile
-                            if self.config.global_profiler.profile_continuous_steps
-                            else curr_step_profile
-                        )
+                with marked_timer("start_profile", timing_raw):
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
 
                 # train step
                 metrics = self._train_step(batch_dict, curr_step_profile=curr_step_profile, is_last_step=is_last_step)
 
                 # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                if self.config.trainer.test_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
@@ -689,20 +630,19 @@ class AgentLightningTrainer(RayPPOTrainer):
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
-                if hasattr(self, "_stop_profiling"):
-                    with marked_timer("stop_profile", timing_raw):
-                        next_step_profile = (
-                            self.global_steps + 1 in self.config.global_profiler.steps
-                            if self.config.global_profiler.steps is not None
-                            else False
-                        )
-                        self._stop_profiling(
-                            curr_step_profile and not next_step_profile
-                            if self.config.global_profiler.profile_continuous_steps
-                            else curr_step_profile
-                        )
-                        prev_step_profile = curr_step_profile
-                        curr_step_profile = next_step_profile
+                with marked_timer("stop_profile", timing_raw):
+                    next_step_profile = (
+                        self.global_steps + 1 in self.config.global_profiler.steps
+                        if self.config.global_profiler.steps is not None
+                        else False
+                    )
+                    self._stop_profiling(
+                        curr_step_profile and not next_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                    prev_step_profile = curr_step_profile
+                    curr_step_profile = next_step_profile
 
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
@@ -750,4 +690,10 @@ class AgentLightningTrainer(RayPPOTrainer):
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
+
+                # this is experimental and may be changed/removed in the future
+                # in favor of a general-purpose data buffer pool
+                if hasattr(self.train_dataset, "on_batch_end"):
+                    # The dataset may be changed after each training batch
+                    self.train_dataset.on_batch_end(batch=batch)
 
