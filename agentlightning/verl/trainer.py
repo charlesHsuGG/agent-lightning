@@ -10,27 +10,27 @@ from copy import deepcopy
 from pprint import pprint
 from typing import Any, Dict, Type
 
-import torch
 import numpy as np
-from tqdm import tqdm
+import torch
 import verl
+from tqdm import tqdm
 from verl import DataProto
-from verl.trainer.ppo.utils import Role
-from verl.utils.debug import marked_timer
-from verl.utils.rollout_skip import RolloutSkip
-from verl.trainer.ppo.core_algos import agg_loss
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import _compute_response_info, compute_throughout_metrics, compute_timing_metrics
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
     RayPPOTrainer,
+    Role,
     apply_kl_penalty,
     compute_advantage,
     compute_response_mask,
 )
+from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
+from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.rollout_skip import RolloutSkip
 
 from agentlightning.adapter import TraceAdapter, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy
@@ -135,14 +135,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, suffix: str 
         "response_length/mean" + suffix: torch.mean(response_length).detach().item(),
         "response_length/max" + suffix: torch.max(response_length).detach().item(),
         "response_length/min" + suffix: torch.min(response_length).detach().item(),
-        "response_length/clip_ratio"
-        + suffix: torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+        "response_length/clip_ratio" + suffix: torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
         # prompt length
         "prompt_length/mean" + suffix: torch.mean(prompt_length).detach().item(),
         "prompt_length/max" + suffix: torch.max(prompt_length).detach().item(),
         "prompt_length/min" + suffix: torch.min(prompt_length).detach().item(),
-        "prompt_length/clip_ratio"
-        + suffix: torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+        "prompt_length/clip_ratio" + suffix: torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
     return metrics
 
@@ -287,16 +285,16 @@ class AgentLightningTrainer(RayPPOTrainer):
 
                     reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
-                if hasattr(self, "_maybe_build_self_distillation_batch"):
-                    self_distillation_data = self._maybe_build_self_distillation_batch(
-                        batch,
-                        reward_tensor,
-                        reward_extra_infos_dict,
-                    )
-                    if self_distillation_data is not None:
-                        self_distillation_batch, self_distillation_metrics = self_distillation_data
-                        batch = batch.union(self_distillation_batch)
-                        metrics.update(self_distillation_metrics)
+                    if hasattr(self, "_maybe_build_self_distillation_batch"):
+                        self_distillation_data = self._maybe_build_self_distillation_batch(
+                            batch,
+                            reward_tensor,
+                            reward_extra_infos_dict,
+                        )
+                        if self_distillation_data is not None:
+                            self_distillation_batch, self_distillation_metrics = self_distillation_data
+                            batch = batch.union(self_distillation_batch)
+                            metrics.update(self_distillation_metrics)
 
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
             batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
@@ -390,9 +388,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                 # Only runs in decoupled mode (computes once per batch using stable π_old)
                 # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
                 if (
-                    rollout_corr_config is not None
-                    and "rollout_log_probs" in batch.batch
-                    and not bypass_recomputing_logprobs  # Only in decoupled mode
+                    rollout_corr_config is not None and "rollout_log_probs" in batch.batch and not bypass_recomputing_logprobs  # Only in decoupled mode
                 ):
                     from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 
@@ -474,9 +470,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                 # 3. The current step number is a multiple of the save frequency.
                 # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
                 if self.config.trainer.save_freq > 0 and (
-                    is_last_step
-                    or self.global_steps % self.config.trainer.save_freq == 0
-                    or esi_close_to_expiration
+                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
                 ):
                     if esi_close_to_expiration:
                         print("Force saving checkpoint: ESI instance expiration approaching.")
@@ -502,6 +496,27 @@ class AgentLightningTrainer(RayPPOTrainer):
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
+        # GDPO per-component reward metrics
+        gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
+        if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
+            for key in gdpo_reward_keys:
+                if key in batch.non_tensor_batch:
+                    vals = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
+                    metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
+                    metrics[f"gdpo/{key}/std"] = float(np.std(vals))
+                    metrics[f"gdpo/{key}/max"] = float(np.max(vals))
+                    metrics[f"gdpo/{key}/min"] = float(np.min(vals))
+
+        # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+        if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+            self.train_dataloader.sampler.update(batch=batch)
+
+        # this is experimental and may be changed/removed in the future
+        # in favor of a general-purpose data buffer pool
+        if hasattr(self.train_dataset, "on_batch_end"):
+            # The dataset may be changed after each training batch
+            self.train_dataset.on_batch_end(batch=batch)
+
         # Explicitly release batch tensors and trigger garbage collection to
         # prevent memory accumulation across training steps.
         del batch
@@ -519,7 +534,6 @@ class AgentLightningTrainer(RayPPOTrainer):
         The light-weight advantage computation is done on the driver process.
         """
         from omegaconf import OmegaConf
-
         from verl.utils.tracking import Tracking
 
         logger = Tracking(
@@ -655,21 +669,6 @@ class AgentLightningTrainer(RayPPOTrainer):
                     }
                 )
 
-                # GDPO per-component reward metrics
-                gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
-                if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
-                    for key in gdpo_reward_keys:
-                        if key in batch.non_tensor_batch:
-                            vals = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
-                            metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
-                            metrics[f"gdpo/{key}/std"] = float(np.std(vals))
-                            metrics[f"gdpo/{key}/max"] = float(np.max(vals))
-                            metrics[f"gdpo/{key}/min"] = float(np.min(vals))
-
-                # this is experimental and may be changed/removed in the future in favor of a general-purpose one
-                if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
-                    self.train_dataloader.sampler.update(batch=batch)
-
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
@@ -677,8 +676,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                 self.global_steps += 1
 
                 if (
-                    hasattr(self.config.actor_rollout_ref.actor, "profiler")
-                    and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+                    hasattr(self.config.actor_rollout_ref.actor, "profiler") and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
                 ):
                     self.actor_rollout_wg.dump_memory_snapshot(
                         tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
@@ -690,10 +688,3 @@ class AgentLightningTrainer(RayPPOTrainer):
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
-
-                # this is experimental and may be changed/removed in the future
-                # in favor of a general-purpose data buffer pool
-                if hasattr(self.train_dataset, "on_batch_end"):
-                    # The dataset may be changed after each training batch
-                    self.train_dataset.on_batch_end(batch=batch)
-
