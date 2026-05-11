@@ -87,21 +87,15 @@ def run_ppo(
             runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
-        allow_broadcast_env = ["HF_", "NVTE_", "CUDA_", "WANDB_", "TIKTOKEN_", "NCCL_", "VLLM_", "SGLANG_", "TORCH_"]
+        allow_broadcast_env = ["HF", "NVTE", "WANDB", "TIKTOKEN", "TOKENIZERS", "NCCL", "VLLM", "SGLANG", "TORCH", "LD_LIBRARY", "TRITON", "CUDA"]
         default_env_vars = {
             key: value for key, value in os.environ.items()
             if any(key.startswith(prefix) for prefix in allow_broadcast_env)
         }
         if "env_vars" not in runtime_env_kwargs:
-            runtime_env_kwargs["env_vars"] = {
-                "TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
-                "VLLM_LOGGING_LEVEL": "WARN", **default_env_vars
-            }
+            runtime_env_kwargs["env_vars"] = default_env_vars
         else:
-            runtime_env_kwargs["env_vars"].update({
-                "TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
-                "VLLM_LOGGING_LEVEL": "WARN", **default_env_vars
-            })
+            runtime_env_kwargs["env_vars"].update(default_env_vars)
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
@@ -110,14 +104,15 @@ def run_ppo(
 
     if task_runner_class is None:
         nodes = ray.nodes()
+        ray_head_node_name = os.environ.get("RAY_HEAD_NODE_NAME", None)
         try:
-            target_node_id = next(node["NodeID"] for node in nodes if "worker-0" in node["NodeManagerHostname"])
+            target_node_id = next(node["NodeID"] for node in nodes if ray_head_node_name in node["NodeManagerHostname"])
             print(f"Scheduling main_task on node_id: {target_node_id}")
             task_runner_class = ray.remote(
                 num_cpus=1, scheduling_strategy=NodeAffinitySchedulingStrategy(target_node_id, soft=False)
             )(TaskRunner)  # please make sure main_task is not scheduled on head
         except StopIteration:
-            print("No node with 'worker-0' in NodeManagerHostname found. The main task will be scheduled without node affinity.")
+            print(f"No node with {ray_head_node_name} in NodeManagerHostname found. The main task will be scheduled without node affinity.")
             task_runner_class = ray.remote(num_cpus=1)(TaskRunner)
 
     # Create a remote instance of the TaskRunner class, and

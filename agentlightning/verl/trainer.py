@@ -11,7 +11,6 @@ from copy import deepcopy
 from pprint import pprint
 from typing import Any, Dict, Type
 
-import numpy as np
 import torch
 import verl
 from codetiming import Timer
@@ -383,12 +382,6 @@ class AgentLightningTrainer(RayPPOTrainer):
             with _timer("adv", timing_raw):
                 # if agent_mode is enabled, there is already token_level_scores
                 # token_level_scores is not needed to compute here
-
-                reward_extra_infos_dict: dict[str, list]
-                batch.batch["token_level_scores"] = reward_tensor
-
-                if reward_extra_infos_dict:
-                    batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                 # compute rewards. apply_kl_penalty if available
                 if self.config.algorithm.use_kl_in_reward:
