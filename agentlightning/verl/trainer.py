@@ -27,6 +27,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
+from verl.trainer.ppo.reward import extract_reward
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
@@ -193,12 +194,11 @@ class AgentLightningTrainer(RayPPOTrainer):
         self.agent_mode_daemon.clear_data_and_server()
         return test_metrics
 
-    def _train_step(self, batch_dict: dict, curr_step_profile: bool = False, is_last_step: bool = False) -> dict:
+    def _train_step(self, batch_dict: dict, timing_raw: dict, curr_step_profile: bool = False, is_last_step: bool = False) -> dict:
         # Isolate in a separate method to automatically recycle the variables before validation.
 
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         metrics = {}
-        timing_raw = {}
 
         with marked_timer("step", timing_raw):
             # When agent mode is enabled, we read the batch as it is.
@@ -278,23 +278,24 @@ class AgentLightningTrainer(RayPPOTrainer):
             with marked_timer("reward", timing_raw, color="yellow"):
                 # compute reward model score
                 if self.use_rm and "rm_scores" not in batch.batch.keys():
-                    from verl.trainer.ppo.reward import extract_reward
-
                     batch_reward = self._compute_reward_colocate(batch)
                     batch = batch.union(batch_reward)
-
                     reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                else:
+                    reward_tensor = batch.batch["token_level_scores"]
+                    reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
+                    reward_extra_infos_dict = {key: batch.non_tensor_batch[key] for key in reward_extra_keys}
 
-                    if hasattr(self, "_maybe_build_self_distillation_batch"):
-                        self_distillation_data = self._maybe_build_self_distillation_batch(
-                            batch,
-                            reward_tensor,
-                            reward_extra_infos_dict,
-                        )
-                        if self_distillation_data is not None:
-                            self_distillation_batch, self_distillation_metrics = self_distillation_data
-                            batch = batch.union(self_distillation_batch)
-                            metrics.update(self_distillation_metrics)
+                if hasattr(self, "_maybe_build_self_distillation_batch"):
+                    self_distillation_data = self._maybe_build_self_distillation_batch(
+                        batch,
+                        reward_tensor,
+                        reward_extra_infos_dict,
+                    )
+                    if self_distillation_data is not None:
+                        self_distillation_batch, self_distillation_metrics = self_distillation_data
+                        batch = batch.union(self_distillation_batch)
+                        metrics.update(self_distillation_metrics)
 
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
             batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
@@ -632,7 +633,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                     )
 
                 # train step
-                metrics = self._train_step(batch_dict, curr_step_profile=curr_step_profile, is_last_step=is_last_step)
+                metrics = self._train_step(batch_dict, timing_raw, curr_step_profile=curr_step_profile, is_last_step=is_last_step)
 
                 # validate
                 if self.config.trainer.test_freq > 0 and (

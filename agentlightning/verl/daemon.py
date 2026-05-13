@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 import uuid
+import logging
 from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any, Dict, List, Literal, Optional, Tuple, cast
@@ -30,6 +31,8 @@ __all__ = [
     "get_left_padded_ids_and_attention_mask",
     "get_right_padded_ids_and_attention_mask",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def extract_prompt_image_urls(prompt_raw_content: Any) -> List[str]:
@@ -895,7 +898,6 @@ class AgentModeDaemon:
             # The client should report triplets that contain prompt_ids and response_ids.
             # Example triplet.prompt: {"token_ids": [...], "image_urls": [...]}
             # Example triplet.response: {"token_ids": [...]}
-            prompt_raw_content = t.prompt.get("raw_content", [])
             trace_list = [
                 {
                     "prompt_ids": t.prompt.get("token_ids", []),
@@ -903,8 +905,8 @@ class AgentModeDaemon:
                     "rollout_log_probs": [
                         log_prob.get("log_prob", 0.0) for log_prob in t.metadata.response.get("log_probs", [])
                     ] if hasattr(t.metadata, "response") and t.metadata.response and t.metadata.response.get("log_probs") else [],
-                    "prompt_raw_content": prompt_raw_content,
-                    "image_urls": extract_prompt_image_urls(prompt_raw_content) if prompt_raw_content else [],
+                    "prompt_raw_content": t.prompt.get("raw_content", []),
+                    "image_urls": extract_prompt_image_urls(t.prompt.get("raw_content", [])) if t.prompt.get("raw_content", []) else [],
                 }
                 for t in rollout.triplets
             ]
