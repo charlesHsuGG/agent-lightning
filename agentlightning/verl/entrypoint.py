@@ -106,7 +106,7 @@ def run_ppo(
         nodes = ray.nodes()
         ray_head_node_name = os.environ.get("RAY_HEAD_NODE_NAME", None)
         try:
-            target_node_id = next(node["NodeID"] for node in nodes if ray_head_node_name in node["NodeManagerHostname"])
+            target_node_id = next(node["NodeID"] for node in nodes if ray_head_node_name is not None and ray_head_node_name in node["NodeManagerHostname"])
             print(f"Scheduling main_task on node_id: {target_node_id}")
             task_runner_class = ray.remote(
                 num_cpus=1, scheduling_strategy=NodeAffinitySchedulingStrategy(target_node_id, soft=False)
