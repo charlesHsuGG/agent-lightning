@@ -109,14 +109,15 @@ def run_ppo(
 
     if task_runner_class is None:
         nodes = ray.nodes()
+        ray_head_node_name = os.environ.get("RAY_HEAD_NODE_NAME", None)
         try:
-            target_node_id = next(node["NodeID"] for node in nodes if "worker-0" in node["NodeManagerHostname"])
+            target_node_id = next(node["NodeID"] for node in nodes if ray_head_node_name is not None and ray_head_node_name in node["NodeManagerHostname"])
             print(f"Scheduling main_task on node_id: {target_node_id}")
             task_runner_class = ray.remote(
                 num_cpus=1, scheduling_strategy=NodeAffinitySchedulingStrategy(target_node_id, soft=False)
             )(TaskRunner)  # please make sure main_task is not scheduled on head
         except StopIteration:
-            print("No node with 'worker-0' in NodeManagerHostname found. The main task will be scheduled without node affinity.")
+            print(f"No node with {ray_head_node_name} in NodeManagerHostname found. The main task will be scheduled without node affinity.")
             task_runner_class = ray.remote(num_cpus=1)(TaskRunner)
 
     # Create a remote instance of the TaskRunner class, and
