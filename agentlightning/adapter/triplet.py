@@ -946,6 +946,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                     if rid in seen_request_ids:
                         continue
                     seen_request_ids.add(rid)
+
                 llm_items.append(
                     dict(
                         span=s,
@@ -957,6 +958,15 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                         prompt_raw_content=prompt_raw_content,
                     )
                 )
+
+        # 3) Check exception Error in trajatories
+        has_exception_error = False
+        for s in spans:
+            if s.name == "agentlightning.exception":
+                attrs = s.attributes or {}
+                excep_type, excep_message = attrs.get("exception.type"), attrs.get("exception.message")
+                logger.error(f"{excep_type}: {excep_message}")
+                has_exception_error = True
 
         # Order LLM items by sequence only.
         llm_items.sort(key=lambda x: x["seq"])
@@ -976,9 +986,11 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                 sid = item["span"].span_id
                 if sid in assigned:
                     continue
-                if item["seq"] < r_seq:
+                if item["seq"] == r_seq - 1:
                     assigned[sid] = r_val
                     break
+
+        final_reward = sorted(rewards, key=lambda x: x[0])[-1] if not has_exception_error and rewards else 0.0
 
         # Build triplets in LLM sequence order.
         triplets: List[Triplet] = []
@@ -989,7 +1001,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                 Triplet(
                     prompt={"token_ids": item["prompt_ids"], "raw_content": prompt_raw_content},
                     response={"token_ids": item["response_ids"]},
-                    reward=assigned.get(s.span_id, None),
+                    reward=assigned.get(s.span_id, None) or final_reward,
                     metadata=dict(
                         # This is called response_id to align with the other adapters.
                         response={"logprobs": item["response_logprobs"]},
