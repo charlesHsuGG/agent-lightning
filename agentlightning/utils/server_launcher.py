@@ -926,7 +926,7 @@ class PythonServerLauncher:
 
         # Gunicorn path when n_workers > 1
         if self.args.n_workers > 1:
-            logger.info(f"Starting Gunicorn server...")
+            logger.info("Starting Gunicorn server...")
             options = {
                 "bind": f"{host}:{port}",
                 "workers": int(self.args.n_workers),

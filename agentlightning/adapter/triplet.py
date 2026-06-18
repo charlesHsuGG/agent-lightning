@@ -629,7 +629,7 @@ class TraceTree:
         logprobs_content = span.attributes.get("logprobs.content", None)  # type: ignore
         if isinstance(logprobs_content, str):
             logprobs_content = json.loads(logprobs_content)
-            response_payload["logprobs"] = logprobs_content
+            response_metadata["logprobs"] = logprobs_content
 
         return Triplet(
             prompt=prompt_payload,
@@ -704,8 +704,7 @@ class TraceTree:
 
     def __repr__(self):
         return (
-            f"TraceTree(id={self.id}, span={self.span}, start_time={self.start_time}, "
-            + f"end_time={self.end_time}, children={self.children})"
+            f"TraceTree(id={self.id}, span={self.span}, start_time={self.start_time}, end_time={self.end_time}, children={self.children})"
         )
 
 
@@ -868,7 +867,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
         if isinstance(resp_choices, list) and resp_choices:
             cand = cast(Any, resp_choices[0])
             if isinstance(cand, dict):
-                logsprobs = cast(Dict[str, Any], cand).pop("logprobs", {}).get("content")
+                logsprobs = cast(Dict[str, Any], cand).pop("logprobs", {}).get("content") if cast(Dict[str, Any], cand).pop("logprobs", {}) is not None else []
                 if isinstance(logsprobs, list):
                     logsprobs = self._literal_eval_maybe(logsprobs)
                     if isinstance(logsprobs, list) and all(isinstance(x, (dict)) for x in logsprobs):  # type: ignore
@@ -990,7 +989,7 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                     assigned[sid] = r_val
                     break
 
-        final_reward = sorted(rewards, key=lambda x: x[0])[-1] if not has_exception_error and rewards else 0.0
+        final_reward = sorted(rewards, key=lambda x: x[0])[-1][1] if not has_exception_error and rewards else 0.0
 
         # Build triplets in LLM sequence order.
         triplets: List[Triplet] = []

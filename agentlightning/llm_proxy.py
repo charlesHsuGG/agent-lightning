@@ -596,7 +596,7 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
             # 2. Recreate the request stream so it can be read again by the route handler
             async def receive() -> Message:
                 return {"type": "http.request", "body": req_body}
-            
+
             request._receive = receive
             try:
                 body_json = json.loads(req_body.decode())
@@ -815,7 +815,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
                     chunk_size = 5
 
                     for i in range(0, len(words), chunk_size):
-                        chunk_words = words[i : i + chunk_size]
+                        chunk_words = words[i: i + chunk_size]
                         text_chunk = " ".join(chunk_words)
 
                         # Add space after chunk unless it's the last one
@@ -853,7 +853,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
                 chunk_size = 20  # characters per chunk for JSON
 
                 for i in range(0, len(input_json), chunk_size):
-                    json_chunk = input_json[i : i + chunk_size]
+                    json_chunk = input_json[i: i + chunk_size]
 
                     content_block_delta = {
                         "type": "content_block_delta",
@@ -993,7 +993,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
             # (b) stream arguments in small substrings
             arg_chunk_size = 40
             for pos in range(0, len(fn_args), arg_chunk_size):
-                partial = fn_args[pos : pos + arg_chunk_size]
+                partial = fn_args[pos: pos + arg_chunk_size]
                 yield sse_chunk(
                     {
                         "id": f"chatcmpl-{created}",
@@ -1143,6 +1143,8 @@ class LLMProxy:
         # Ensure num_retries is present inside the litellm_settings block.
         self.litellm_config.setdefault("litellm_settings", {})
         self.litellm_config["litellm_settings"].setdefault("num_retries", num_retries)
+        self.litellm_config["litellm_settings"].setdefault("ssl_verify", False)
+        self.litellm_config["litellm_settings"].setdefault("request_timeout", 3600)
         self.server_launcher = PythonServerLauncher(app, self.server_launcher_args, noop_context())
 
         self._config_file = None
@@ -1163,7 +1165,7 @@ class LLMProxy:
 
         self.callbacks: List[Type[CustomLogger]] = []
         if callbacks is None:
-            callbacks = ["return_token_ids", "opentelemetry", "logprobs"]
+            callbacks = ["return_token_ids", "opentelemetry"]
         for callback in callbacks:
             if isinstance(callback, str):
                 if callback not in _CALLBACK_REGISTRY:
@@ -1277,6 +1279,16 @@ class LLMProxy:
         # Ready
         logger.info("LLMProxy preparation is done. Will start the server.")
         yield
+
+        # Close any cached aiohttp sessions held by the store client to
+        # prevent resource leaks (file descriptors, TCP connections) that
+        # can accumulate across training restarts and cause MCP server
+        # timeouts.  See https://github.com/microsoft/agent-lightning/issues/471
+        if self.store is not None and hasattr(self.store, "close"):
+            try:
+                await self.store.close()
+            except Exception:
+                logger.warning("Error closing store sessions during LLMProxy cleanup.", exc_info=True)
 
         # Clean up
 
@@ -1489,8 +1501,7 @@ def _check_tracer_provider() -> bool:
         bool: True if the tracer provider is valid, else False.
     """
     if (
-        hasattr(trace_api, "_TRACER_PROVIDER")
-        and trace_api._TRACER_PROVIDER is not None  # pyright: ignore[reportPrivateUsage]
+        hasattr(trace_api, "_TRACER_PROVIDER") and trace_api._TRACER_PROVIDER is not None  # pyright: ignore[reportPrivateUsage]
     ):
         return True
     return False
