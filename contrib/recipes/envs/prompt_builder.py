@@ -1,7 +1,5 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-from typing import Optional
-
 from autogen_core.models import AssistantMessage, UserMessage
 
 
@@ -80,7 +78,7 @@ class HistoryPromptBuilder:
         self._events.clear()
 
         if self.prompt_type == "chat":
-            inst_prompt = env.get_instruction_prompt(info)
+            inst_prompt = env.get_instruction_prompt()
             self.update_instruction_prompt(inst_prompt)
         elif self.prompt_type == "single":
             template_wo_his, template = env.get_single_prompt_template()
@@ -96,7 +94,7 @@ class HistoryPromptBuilder:
             List[Message]: A sequence of User and Assistant messages.
         """
         if self.max_history != -1:
-            events = self._events[-(self.max_history * 2 + 1) :]
+            events = self._events[-(self.max_history * 2 + 1):]
         else:
             events = self._events
 
@@ -130,7 +128,7 @@ class HistoryPromptBuilder:
             List[Message]: A single User message.
         """
         if self.max_history != -1:
-            events = self._events[-(self.max_history * 2 + 1) :]
+            events = self._events[-(self.max_history * 2 + 1):]
         else:
             events = self._events
 
@@ -152,9 +150,9 @@ class HistoryPromptBuilder:
             for idx, event in enumerate(events):
                 if events[idx]["type"] == "observation" and idx != len(events) - 1:
                     next_event = events[idx + 1]
-                    history += f"[Observation {max(self.step_count-self.max_history+obs_count, 1)}: '{event['text']}', "
+                    history += f"[Observation {max(self.step_count - self.max_history + obs_count, 1)}: '{event['text']}', "
                     history += (
-                        f"Action {max(self.step_count-self.max_history+obs_count, 1)}: '{next_event['action']}']\n "
+                        f"Action {max(self.step_count - self.max_history + obs_count, 1)}: '{next_event['action']}']\n "
                     )
                     obs_count += 1
 
