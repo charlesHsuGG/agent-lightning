@@ -1051,7 +1051,7 @@ class AgentModeDaemon:
                         response_ids = prompt_ids[max_prompt_length:]
                         prompt_ids = prompt_ids[:max_prompt_length]
                         response_mask = [1] * len(response_ids)
-                        if sample_info["trace_list"][current_merged_trace_idx[0]].get("rollout_log_probs"):
+                        if sample_info["trace_list"][current_merged_trace_idx[0]].get("rollout_log_probs", []):
                             rollout_log_probs = [0.0] * len(response_ids)  # No log probs for the shifted part
                         else:
                             rollout_log_probs = []
@@ -1063,7 +1063,7 @@ class AgentModeDaemon:
                     prompt_length = len(prompt_ids)
                     response_ids += sample_info["trace_list"][current_merged_trace_idx[0]]["response_ids"]
                     response_mask += [1] * len(response_ids)
-                    if sample_info["trace_list"][current_merged_trace_idx[0]].get("rollout_log_probs"):
+                    if sample_info["trace_list"][current_merged_trace_idx[0]].get("rollout_log_probs", []):
                         rollout_log_probs += sample_info["trace_list"][current_merged_trace_idx[0]].get("rollout_log_probs", [])
                     for turn_index in current_merged_trace_idx[1:]:
                         trace = sample_info["trace_list"][turn_index]
@@ -1072,7 +1072,7 @@ class AgentModeDaemon:
                         response_ids += trace["response_ids"]
                         response_mask += [0] * new_prompt_length
                         response_mask += [1] * len(trace["response_ids"])
-                        if trace.get("rollout_log_probs"):
+                        if trace.get("rollout_log_probs", []):
                             rollout_log_probs += [0.0] * new_prompt_length
                             rollout_log_probs += trace.get("rollout_log_probs", [])
 
@@ -1089,7 +1089,8 @@ class AgentModeDaemon:
                     if len(response_ids) > max_response_length:
                         response_ids = response_ids[:max_response_length]
                         response_mask = response_mask[:max_response_length]
-                        rollout_log_probs = rollout_log_probs[:max_response_length]
+                        if len(rollout_log_probs) == len(response_ids):
+                            rollout_log_probs = rollout_log_probs[:max_response_length]
                         n_trunc_sample_because_of_response += 1
 
                     # Pad prompts to the left and responses to the right
@@ -1102,19 +1103,22 @@ class AgentModeDaemon:
                     one_response_mask, _ = get_right_padded_ids_and_attention_mask(
                         response_mask, max_response_length, 0
                     )
-                    if len(rollout_log_probs) > max_response_length:
-                        rollout_log_probs = rollout_log_probs[:max_response_length]
+                    if rollout_log_probs:
+                        one_rollout_log_probs, _ = get_right_padded_ids_and_attention_mask(
+                            rollout_log_probs, max_response_length, 0
+                        )
                     else:
-                        rollout_log_probs += [0.0] * (max_response_length - len(rollout_log_probs))
-
+                        one_rollout_log_probs = None
+    
                     input_ids_list.append(one_input_ids)
                     input_attention_mask_list.append(one_input_attention_mask)
                     response_ids_list.append(one_response_ids)
                     response_attention_mask_list.append(one_response_attention_mask)
                     response_mask_list.append(one_response_mask)
-                    rollout_log_probs_list.append(rollout_log_probs)
                     data_id_list.append(sample_info["data_id"])
                     rollout_id_list.append(rollout_id)
+                    if one_rollout_log_probs is not None:
+                        rollout_log_probs_list.append(rollout_log_probs)
                     if image_grid_thw is not None:
                         image_grid_thw_list.append(image_grid_thw)
                     # turn_index_list.append(current_merged_trace_idx)
@@ -1129,7 +1133,7 @@ class AgentModeDaemon:
         response_mask = (
             torch.LongTensor(response_mask_list).to(device) if self.trace_aggregator.get("level", "transition") == "trajectory" else None  # type: ignore
         )
-        rollout_log_probs = torch.FloatTensor(rollout_log_probs_list).to(device)
+        rollout_log_probs = torch.FloatTensor(rollout_log_probs_list).to(device) if rollout_log_probs_list else None
 
         # Concatenate prompts and responses to form the full sequence
         batch_seq = torch.cat([batch_input_ids, batch_response_ids], dim=-1)
@@ -1180,12 +1184,15 @@ class AgentModeDaemon:
                 "position_ids": position_ids,
                 "is_drop_mask": is_drop_mask,
                 "token_level_scores": token_level_scores.contiguous(),
-                "rollout_log_probs": rollout_log_probs,
                 **(
                     {"response_mask": response_mask}
                     if self.trace_aggregator.get("level", "transition") == "trajectory"
                     else {}
                 ),
+                **(
+                    {"rollout_log_probs": rollout_log_probs}
+                    if rollout_log_probs is not None else {}
+                )
             },  # type: ignore
             batch_size=n_transition,
         )
